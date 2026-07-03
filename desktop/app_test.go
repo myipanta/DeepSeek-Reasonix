@@ -1890,7 +1890,7 @@ func TestEnsureTabControllerWorkspaceRebuildsStaleWorkspace(t *testing.T) {
 func TestSteerForTabReconcilesStaleWorkspaceBeforeIdleFallback(t *testing.T) {
 	f := newStaleWorkspaceBindingFixture(t, "steer_idle_fallback")
 
-	if err := f.app.SteerForTab(f.tab.ID, "/unknown-command"); err != nil {
+	if err := f.app.SteerForTab(f.tab.ID, "/tree"); err != nil {
 		t.Fatalf("SteerForTab: %v", err)
 	}
 	waitNotRunning(t, f.tab.Ctrl)
@@ -2026,10 +2026,10 @@ func runQuickClickWorkspaceReconcileTest(t *testing.T, layoutStyle string) {
 		run  func() error
 	}
 	actions := []quickAction{
-		{name: "submit", run: func() error { return f.app.SubmitToTab(f.tab.ID, "/unknown-command") }},
-		{name: "steer", run: func() error { return f.app.SteerForTab(f.tab.ID, "/unknown-command") }},
+		{name: "submit", run: func() error { return f.app.SubmitToTab(f.tab.ID, "/tree") }},
+		{name: "steer", run: func() error { return f.app.SteerForTab(f.tab.ID, "/tree") }},
 		{name: "compact", run: func() error { return f.app.Compact() }},
-		{name: "submit-display", run: func() error { return f.app.SubmitDisplayToTab(f.tab.ID, "/unknown display", "/unknown-command") }},
+		{name: "submit-display", run: func() error { return f.app.SubmitDisplayToTab(f.tab.ID, "/tree display", "/tree") }},
 	}
 
 	start := make(chan struct{})
