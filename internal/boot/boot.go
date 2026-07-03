@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	"reasonix/internal/environment"
 	"reasonix/internal/event"
 	"reasonix/internal/guardian"
 	"reasonix/internal/history"
@@ -217,6 +219,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if err != nil {
 		return nil, err
 	}
+	shell := sandbox.ResolveShell(cfg.Tools.Shell.Prefer, cfg.Tools.Shell.Path, stderr)
 
 	sysPrompt, err := cfg.ResolveSystemPromptForRoot(root)
 	if err != nil {
@@ -232,6 +235,24 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	sysPrompt += "\n\n" + config.LanguagePolicy
 	if tokenEconomy {
 		sysPrompt += "\n\n" + tokenEconomyPrompt
+	}
+	if cfg.EnvironmentEnabled() {
+		shellLabel := shell.Kind.String()
+		if strings.TrimSpace(cfg.Tools.Shell.Path) != "" {
+			shellLabel = shell.Path
+		}
+		envSection := environment.FormatSection(
+			environment.RunProbesWithOptions(ctx, environment.DefaultProbes(), environment.ProbeOptions{
+				Overrides: cfg.Environment.Tools,
+				DenyRoots: []string{root},
+			}),
+			runtime.GOOS+"/"+runtime.GOARCH,
+			shellLabel,
+			cfg.Environment.Tools,
+		)
+		if envSection != "" {
+			sysPrompt += "\n\n" + envSection
+		}
 	}
 
 	// Persistent memory (REASONIX.md / AGENTS.md hierarchy + auto-memory index)
@@ -264,7 +285,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 
 	reg := tool.NewRegistry()
 	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: cfg.WriteRootsForRoot(root), ForbidReadRoots: cfg.ForbidReadRootsForRoot(root), Network: cfg.Sandbox.Network}
-	shell := sandbox.ResolveShell(cfg.Tools.Shell.Prefer, cfg.Tools.Shell.Path, stderr)
 	bashSpec.Shell = shell
 	if bashSpec.Mode == "enforce" && !sandbox.Available() {
 		fmt.Fprintln(stderr, "warning: bash sandbox requested but unavailable on this platform; running bash unconfined")
@@ -549,17 +569,19 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 	taskModel := firstNonEmpty(cfg.Agent.SubagentModels["task"], cfg.Agent.SubagentModel)
 	taskEffort := firstNonEmpty(cfg.Agent.SubagentEfforts["task"], cfg.Agent.SubagentEffort)
+	maxSubagentDepth := agent.NormalizeMaxSubagentDepth(cfg.Agent.MaxSubagentDepth)
 	taskToolAdded := false
 	readOnlyTaskToolAdded := false
 	var taskTool *agent.TaskTool
 	newTaskTool := func() *agent.TaskTool {
 		return agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
-			entry.ContextWindow, cfg.Agent.RecentKeep, cfg.Agent.SoftCompactRatio, cfg.Agent.CompactRatio, cfg.Agent.CompactForceRatio,
+			entry.ContextWindow, cfg.Agent.RecentKeep, cfg.Agent.SoftCompactRatio, cfg.Agent.ToolResultSnipRatio, cfg.Agent.CompactRatio, cfg.Agent.CompactForceRatio,
 			cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate,
 			keepPolicy,
 			taskModel, taskEffort, resolveSubagentProvider).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
-			WithTranscriptIdentityResolver(subagentIdentity)
+			WithTranscriptIdentityResolver(subagentIdentity).
+			WithMaxSubagentDepth(maxSubagentDepth)
 	}
 	addTaskTool := func() string {
 		if taskToolAdded {
@@ -631,7 +653,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}
 			prov, price, ctxWin = p, pr, cw
 		}
-		subReg := agent.ReadOnlySubagentToolRegistry(reg, sk.AllowedTools)
+		childDepth := agent.SubagentDepth(sctx) + 1
+		if childDepth > maxSubagentDepth {
+			return "", fmt.Errorf("subagent delegation depth limit reached (max_subagent_depth=%d)", maxSubagentDepth)
+		}
+		subReg := agent.ReadOnlySubagentToolRegistryForDepth(reg, sk.AllowedTools, childDepth, maxSubagentDepth)
 		if subReg.Len() == 0 {
 			return "", fmt.Errorf("read_only_skill: skill %q has no read-only tools available", sk.Name)
 		}
@@ -643,19 +669,22 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 		sysPrompt := agent.DefaultReadOnlyTaskSystemPrompt + "\n\nSkill instructions:\n" + sk.Body
 		return agent.RunSubAgentWithSession(sctx, prov, subReg, agent.NewSession(sysPrompt), task, agent.Options{
-			MaxSteps:          steps,
-			Temperature:       cfg.Agent.Temperature,
-			Pricing:           price,
-			UsageSource:       event.UsageSourceSubagent,
-			Gate:              headlessGate,
-			ContextWindow:     ctxWin,
-			RecentKeep:        cfg.Agent.RecentKeep,
-			SoftCompactRatio:  cfg.Agent.SoftCompactRatio,
-			CompactRatio:      cfg.Agent.CompactRatio,
-			CompactForceRatio: cfg.Agent.CompactForceRatio,
-			ArchiveDir:        config.ArchiveDir(),
-			KeepPolicy:        keepPolicy,
-			ReasoningLanguage: agent.ReasoningLanguageFromContext(sctx),
+			MaxSteps:            steps,
+			Temperature:         cfg.Agent.Temperature,
+			Pricing:             price,
+			UsageSource:         event.UsageSourceSubagent,
+			Gate:                headlessGate,
+			ContextWindow:       ctxWin,
+			RecentKeep:          cfg.Agent.RecentKeep,
+			SoftCompactRatio:    cfg.Agent.SoftCompactRatio,
+			ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
+			CompactRatio:        cfg.Agent.CompactRatio,
+			CompactForceRatio:   cfg.Agent.CompactForceRatio,
+			ArchiveDir:          config.ArchiveDir(),
+			KeepPolicy:          keepPolicy,
+			ReasoningLanguage:   agent.ReasoningLanguageFromContext(sctx),
+			SubagentDepth:       childDepth,
+			MaxSubagentDepth:    maxSubagentDepth,
 		}, agent.NestedSink(sctx, event.Discard))
 	}
 	// Writer-capable subagent skills reuse the sub-agent machinery via this
@@ -675,7 +704,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}
 			prov, price, ctxWin = p, pr, cw
 		}
-		subReg := agent.SubagentToolRegistry(reg, sk.AllowedTools)
+		childDepth := agent.SubagentDepth(sctx) + 1
+		if childDepth > maxSubagentDepth {
+			return "", fmt.Errorf("subagent delegation depth limit reached (max_subagent_depth=%d)", maxSubagentDepth)
+		}
+		subReg := agent.SubagentToolRegistryForDepth(reg, sk.AllowedTools, childDepth, maxSubagentDepth)
 		continueFrom := strings.TrimSpace(runOpts.ContinueFrom)
 		legacyForkFrom := strings.TrimSpace(runOpts.ForkFrom)
 		if continueFrom != "" && legacyForkFrom != "" {
@@ -736,6 +769,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			ArchiveDir:        config.ArchiveDir(),
 			KeepPolicy:        keepPolicy,
 			ReasoningLanguage: agent.ReasoningLanguageFromContext(sctx),
+			SubagentDepth:     childDepth,
+			MaxSubagentDepth:  maxSubagentDepth,
 		}, agent.NestedSink(sctx, event.Discard))
 		if err != nil {
 			return "", errors.Join(err, subagentStore.SaveFailed(run))
@@ -954,6 +989,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		ProjectChecks:                      projectChecks,
 		ContextWindow:                      entry.ContextWindow,
 		SoftCompactRatio:                   cfg.Agent.SoftCompactRatio,
+		ToolResultSnipRatio:                cfg.Agent.ToolResultSnipRatio,
 		CompactRatio:                       cfg.Agent.CompactRatio,
 		CompactForceRatio:                  cfg.Agent.CompactForceRatio,
 		RecentKeep:                         cfg.Agent.RecentKeep,
@@ -961,7 +997,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		KeepPolicy:                         keepPolicy,
 		ReasoningLanguage:                  cfg.ReasoningLanguage(),
 		PlanModeAllowedTools:               cfg.Agent.PlanModeAllowedTools,
+		SubagentDepth:                      0,
+		MaxSubagentDepth:                   maxSubagentDepth,
 		MemoryCompiler:                     memCompiler,
+		MemoryCompilerVerbosity:            cfg.MemoryCompilerVerbosity(),
 		UseMemoryCompilerLLMClassification: strings.TrimSpace(os.Getenv("REASONIX_MEMORY_COMPILER_LLM_CLASSIFICATION")) == "true",
 	}, sink)
 
@@ -999,17 +1038,18 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			plannerSess := agent.NewSession(agent.PlannerPromptWithContext(mem.Block()))
 			plannerTools := agent.PlannerToolRegistry(reg)
 			runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, plannerTools, agent.Options{
-				MaxSteps:          cfg.Agent.PlannerMaxSteps,
-				MaxStepsKey:       "agent.planner_max_steps",
-				Gate:              headlessGate,
-				ContextWindow:     pe.ContextWindow,
-				SoftCompactRatio:  cfg.Agent.SoftCompactRatio,
-				CompactRatio:      cfg.Agent.CompactRatio,
-				CompactForceRatio: cfg.Agent.CompactForceRatio,
-				RecentKeep:        cfg.Agent.RecentKeep,
-				ArchiveDir:        config.ArchiveDir(),
-				KeepPolicy:        keepPolicy,
-				ReasoningLanguage: cfg.ReasoningLanguage(),
+				MaxSteps:            cfg.Agent.PlannerMaxSteps,
+				MaxStepsKey:         "agent.planner_max_steps",
+				Gate:                headlessGate,
+				ContextWindow:       pe.ContextWindow,
+				SoftCompactRatio:    cfg.Agent.SoftCompactRatio,
+				ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
+				CompactRatio:        cfg.Agent.CompactRatio,
+				CompactForceRatio:   cfg.Agent.CompactForceRatio,
+				RecentKeep:          cfg.Agent.RecentKeep,
+				ArchiveDir:          config.ArchiveDir(),
+				KeepPolicy:          keepPolicy,
+				ReasoningLanguage:   cfg.ReasoningLanguage(),
 			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier))
 			label = entry.Model + " + planner " + pe.Model
 		}
@@ -1334,6 +1374,9 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 			"thinking":           e.Thinking,
 			"effort":             config.EffectiveEffort(e),
 			"reasoning_protocol": config.ReasoningProtocolForEntry(e),
+			"chat_url":           e.ChatURL,
+			"headers":            e.Headers,
+			"extra_body":         e.ExtraBody,
 			"proxy_spec":         proxy,
 			"vision":             config.EffectiveVision(e),
 			"vision_detail":      e.VisionDetail,

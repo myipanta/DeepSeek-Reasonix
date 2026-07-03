@@ -185,7 +185,16 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 			defer wg.Done()
 			nested := subSinkFor(subID, sink)
 			modelRef, effortRef := p.taskTool.effectiveProfile(t.Model, t.Effort)
-			subReg := p.taskTool.buildSubReg(t.Tools)
+			childDepth, depthErr := p.taskTool.nextSubagentDepth(ctx)
+			if depthErr != nil {
+				sink.Emit(event.Event{
+					Kind: event.ToolResult,
+					Tool: event.Tool{ID: subID, ParentID: parentID, Name: "task", Err: depthErr.Error()},
+				})
+				doneCh <- subResult{index: idx, err: depthErr}
+				return
+			}
+			subReg := p.taskTool.buildSubReg(t.Tools, childDepth)
 
 			max := t.MaxSteps
 			if max <= 0 {
@@ -204,18 +213,21 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 
 			sess := NewSession("")
 			output, runErr := RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, Options{
-				MaxSteps:          max,
-				Temperature:       p.taskTool.temperature,
-				Pricing:           pricing,
-				UsageSource:       event.UsageSourceSubagent,
-				Gate:              p.taskTool.gate,
-				ContextWindow:     ctxWin,
-				RecentKeep:        p.taskTool.recentKeep,
-				SoftCompactRatio:  p.taskTool.softCompactRatio,
-				CompactRatio:      p.taskTool.compactRatio,
-				CompactForceRatio: p.taskTool.compactForceRatio,
-				ArchiveDir:        p.taskTool.archiveDir,
-				KeepPolicy:        p.taskTool.keepPolicy,
+				MaxSteps:            max,
+				Temperature:         p.taskTool.temperature,
+				Pricing:             pricing,
+				UsageSource:         event.UsageSourceSubagent,
+				Gate:                p.taskTool.gate,
+				ContextWindow:       ctxWin,
+				RecentKeep:          p.taskTool.recentKeep,
+				SoftCompactRatio:    p.taskTool.softCompactRatio,
+				ToolResultSnipRatio: p.taskTool.toolResultSnipRatio,
+				CompactRatio:        p.taskTool.compactRatio,
+				CompactForceRatio:   p.taskTool.compactForceRatio,
+				ArchiveDir:          p.taskTool.archiveDir,
+				KeepPolicy:          p.taskTool.keepPolicy,
+				SubagentDepth:       childDepth,
+				MaxSubagentDepth:    p.taskTool.maxDepth(),
 			}, nested)
 
 			if ctx.Err() != nil && runErr == nil {

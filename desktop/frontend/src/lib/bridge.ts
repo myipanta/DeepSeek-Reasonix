@@ -16,6 +16,9 @@ import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems } from "./statusBarIt
 import { modeHasAutoApproveTools, modeWithAutoApproveTools, modeWithPlan, normalizeCollaborationMode, normalizeMode, normalizeTokenMode, normalizeToolApprovalMode } from "./types";
 
 import type {
+  AutoResearchFindingView,
+  AutoResearchEvidenceView,
+  AutoResearchStatusView,
   BalanceInfo,
   BotConnectionDiagnostic,
   BotInstallPollResult,
@@ -45,6 +48,8 @@ import type {
   Mode,
   ModelInfo,
   NetworkView,
+  PluginInstallOptions,
+  PluginView,
   ProjectNode,
   PromptHistoryEntry,
   PromptHistoryResult,
@@ -115,6 +120,10 @@ interface DesktopWindowState {
 // to AppBindings, then run `pnpm typecheck` to verify.
 export interface AppBindings {
   Platform(): Promise<string>;
+  MinimiseMainWindow(): Promise<void>;
+  ToggleMaximiseMainWindow(): Promise<void>;
+  IsMainWindowMaximised(): Promise<boolean>;
+  CloseMainWindow(): Promise<void>;
   // ── Heartbeat ──
   HeartbeatListTasks(): Promise<unknown>;
   HeartbeatReloadTasks(): Promise<unknown>;
@@ -125,6 +134,7 @@ export interface AppBindings {
   SubmitToTab(tabID: string, input: string): Promise<void>;
   SubmitDisplay(display: string, input: string): Promise<void>;
   SubmitDisplayToTab(tabID: string, display: string, input: string): Promise<void>;
+  SubmitEditedDisplayToTab(tabID: string, display: string, input: string, original: string): Promise<void>;
   RunShell(command: string): Promise<void>;
   RunShellForTab(tabID: string, command: string): Promise<void>;
   Steer(text: string): Promise<void>;
@@ -189,10 +199,23 @@ export interface AppBindings {
   ToolResultForTab(tabID: string, toolID: string): Promise<{ args: string; output: string } | null>;
   Meta(): Promise<Meta>;
   MetaForTab(tabID: string): Promise<Meta>;
+  AutoResearchCurrent(): Promise<AutoResearchStatusView>;
+  AutoResearchStatus(tabID: string): Promise<AutoResearchStatusView>;
+  AutoResearchList(tabID: string): Promise<AutoResearchStatusView[]>;
+  AutoResearchFindings(tabID: string, limit: number): Promise<AutoResearchFindingView[]>;
+  AutoResearchOpenTask(tabID: string): Promise<void>;
+  AutoResearchRecordEvidence(tabID: string, criterionID: string, input: AutoResearchEvidenceView): Promise<void>;
   Commands(): Promise<CommandInfo[]>;
   Capabilities(): Promise<CapabilitiesView>;
   MCPServers(): Promise<ServerView[]>;
   SkillsSettings(): Promise<SkillsSettingsView>;
+  Plugins(): Promise<PluginView[]>;
+  PlanPluginInstall(source: string, options: PluginInstallOptions): Promise<string>;
+  InstallPlugin(source: string, options: PluginInstallOptions): Promise<string>;
+  RemovePlugin(name: string): Promise<void>;
+  SetPluginEnabled(name: string, enabled: boolean): Promise<void>;
+  UpdatePlugin(name: string): Promise<string>;
+  PluginDoctor(name: string): Promise<PluginView>;
   AddMCPServer(input: MCPServerInput): Promise<number>;
   UpdateMCPServer(name: string, input: MCPServerInput): Promise<void>;
   RemoveMCPServer(name: string): Promise<void>;
@@ -202,6 +225,7 @@ export interface AppBindings {
   TrustMCPServerTools(name: string, toolNames: string[]): Promise<void>;
   UntrustMCPServerTool(name: string, toolName: string): Promise<void>;
   PickSkillFolder(): Promise<string>;
+  PickPluginFolder(): Promise<string>;
   AddSkillPath(path: string): Promise<void>;
   RemoveSkillPath(path: string): Promise<void>;
   RefreshSkills(): Promise<void>;
@@ -263,6 +287,7 @@ export interface AppBindings {
   SetPlannerModel(ref: string): Promise<void>;
   SetSubagentModel(ref: string): Promise<void>;
   SetSubagentEffort(level: string): Promise<void>;
+  SetMaxSubagentDepth(depth: number): Promise<void>;
   SetAutoPlan(mode: string): Promise<void>;
   SetDefaultToolApprovalMode(mode: string): Promise<void>;
   SaveProvider(p: ProviderView): Promise<void>;
@@ -293,6 +318,9 @@ export interface AppBindings {
   SetDesktopLanguage(lang: string): Promise<void>;
   SetDesktopAppearance(theme: string, style: string): Promise<void>;
   SetDesktopLayoutStyle(style: string): Promise<void>;
+  SetDesktopZoomFactor(factor: number): Promise<void>;
+  GetDesktopZoomFactor(): Promise<number>;
+  RestartApplication(): Promise<void>;
   SetDesktopCheckUpdates(enabled: boolean): Promise<void>;
   SetDesktopTelemetry(enabled: boolean): Promise<void>;
   SetDesktopMetrics(enabled: boolean): Promise<void>;
@@ -393,6 +421,8 @@ const EVENT_CHANNEL = "agent:event";
 const RECENT_NATIVE_FILE_DRAG_MS = 2000;
 const WAILS_NON_FILE_DRAG_MESSAGE = "additional File object is not a file on the disk";
 const UNCAUGHT_ERROR_PREFIX_RE = /^Uncaught(?:\s+\(in promise\))?(?:\s+\w*Error)?:\s*/i;
+const WAILS_IPC_CONNECTING_RE = /Failed to execute 'send' on 'WebSocket': Still in CONNECTING state/i;
+const WAILS_IPC_NULL_SEND_RE = /Cannot read properties of null \(reading 'send'\)/i;
 
 // Resolve the Wails binding at CALL time, not module-load time: in dev the Wails
 // runtime can inject window.go AFTER this module first evaluates, so snapshotting
@@ -451,6 +481,11 @@ export function isWailsNonFileDragErrorEvent(
   return event.error != null && isWailsNonFileDragError(event.message, recentNativeFileDrag);
 }
 
+export function isTransientWailsIPCError(err: unknown): boolean {
+  const msg = errorMessage(err).trim().replace(UNCAUGHT_ERROR_PREFIX_RE, "");
+  return WAILS_IPC_CONNECTING_RE.test(msg) || WAILS_IPC_NULL_SEND_RE.test(msg);
+}
+
 function dataTransferLooksLikeFileDrag(dt: DataTransfer | null): boolean {
   if (!dt) return false;
   if (dt.files?.length > 0) return true;
@@ -471,12 +506,12 @@ export function installWailsNonFileDragErrorSuppression(): () => void {
     };
     const hasRecentNativeFileDrag = () => Date.now() - lastNativeFileDragAt <= RECENT_NATIVE_FILE_DRAG_MS;
     const suppressNonFileDragError = (e: ErrorEvent) => {
-      if (isWailsNonFileDragErrorEvent(e, hasRecentNativeFileDrag())) {
+      if (isWailsNonFileDragErrorEvent(e, hasRecentNativeFileDrag()) || isTransientWailsIPCError(e.error ?? e.message)) {
         e.preventDefault();
       }
     };
     const suppressNonFileDragRejection = (e: PromiseRejectionEvent) => {
-      if (isWailsNonFileDragError(e.reason, hasRecentNativeFileDrag())) {
+      if (isWailsNonFileDragError(e.reason, hasRecentNativeFileDrag()) || isTransientWailsIPCError(e.reason)) {
         e.preventDefault();
       }
     };
@@ -531,9 +566,9 @@ export function onFilesDropped(cb: (paths: string[]) => void): () => void {
 
 // onReady subscribes to the agent:ready event fired when boot.Build completes.
 // The frontend re-fetches Meta/Context/History when this lands.
-export function onReady(cb: () => void): () => void {
+export function onReady(cb: (tabId?: string) => void): () => void {
   if (realApp() && typeof window !== "undefined" && window.runtime) {
-    return window.runtime.EventsOn("agent:ready", () => cb());
+    return window.runtime.EventsOn("agent:ready", (tabId?: unknown) => cb(typeof tabId === "string" ? tabId : undefined));
   }
   // In dev mock, fire immediately since there's no real boot sequence.
   cb();
@@ -553,7 +588,7 @@ function bridgeBreadcrumb(method: string): string {
   if (method === "ReportCrash") return "";
   if (/^(Submit|SubmitDisplay|RunShell|Steer|Cancel|Approve|AnswerQuestion|ReplayPendingPrompts)/.test(method))
     return `turn ${method}`;
-  if (/^(SetModel|SetEffort|SetTokenMode|SetDefaultModel|SetPlannerModel|SetSubagentModel|SetSubagentEffort)/.test(method))
+  if (/^(SetModel|SetEffort|SetTokenMode|SetDefaultModel|SetPlannerModel|SetSubagentModel|SetSubagentEffort|SetMaxSubagentDepth)/.test(method))
     return `model ${method}`;
   if (/^(SetDesktop|SetCloseBehavior|SetDisplayMode|SetStatusBar|SetExpandThinking|SetAutoPlan|SetDefaultToolApprovalMode|SetMemoryCompilerEnabled|SetReasoningLanguage)/.test(method))
     return `settings ${method}`;
@@ -564,6 +599,7 @@ function bridgeBreadcrumb(method: string): string {
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion)/.test(method))
     return `skill ${method}`;
+  if (/^(MinimiseMainWindow|ToggleMaximiseMainWindow|IsMainWindowMaximised|CloseMainWindow)$/.test(method)) return `window ${method}`;
   if (/^(OpenProjectTab|OpenGlobalTab|OpenTopicSession|EnsureBlankTab|ActivateTopic|EnsureBlankSurface|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace)/.test(method))
     return `nav ${method}`;
   return "";
@@ -661,10 +697,11 @@ function browserPlatformOverride(): "darwin" | "windows" | "linux" | "" {
   return value === "darwin" || value === "windows" || value === "linux" ? value : "";
 }
 
-function mockScenario(): "demo" | "fresh" | "running" {
+function mockScenario(): "demo" | "fresh" | "running" | "guidance" {
   if (typeof window === "undefined") return "demo";
   const value = new URLSearchParams(window.location.search).get("mock")?.trim().toLowerCase();
   if (value === "fresh" || value === "empty" || value === "first-run") return "fresh";
+  if (value === "guidance" || value === "guide" || value === "steer") return "guidance";
   if (value === "running" || value === "busy" || value === "streaming") return "running";
   return "demo";
 }
@@ -672,7 +709,8 @@ function mockScenario(): "demo" | "fresh" | "running" {
 function makeMockApp(): AppBindings {
   const scenario = mockScenario();
   const freshMock = scenario === "fresh";
-  const runningMock = scenario === "running";
+  const guidanceMock = scenario === "guidance";
+  const runningMock = scenario === "running" || guidanceMock;
   let cancelled = false;
   let pendingAskPreview = false;
   let pendingApprovalPreview = false;
@@ -761,6 +799,7 @@ function makeMockApp(): AppBindings {
       ],
     },
   ];
+  let capPlugins: PluginView[] = [];
   const mockSwitchWorkspace = async (path: string) => {
     cwd = path || "~";
     workspaces = [cwd, ...workspaces.filter((p) => p !== cwd)].slice(0, 12);
@@ -856,7 +895,7 @@ function makeMockApp(): AppBindings {
       noProxy: "",
       proxy: { type: "socks5", server: "127.0.0.1", port: 7890, username: "", password: "" },
     },
-    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto" },
+    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 0, maxSubagentDepth: 2, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto" },
     bot: {
       enabled: !freshMock,
       model: "",
@@ -1361,7 +1400,7 @@ function makeMockApp(): AppBindings {
       collaborationMode: "normal",
       toolApprovalMode: "ask",
       tokenMode: "full",
-      active: true,
+      active: !guidanceMock,
       cwd: "~/projects/joyquant-db",
     },
     {
@@ -1381,7 +1420,7 @@ function makeMockApp(): AppBindings {
       collaborationMode: "normal",
       toolApprovalMode: "ask",
       tokenMode: "full",
-      active: false,
+      active: guidanceMock,
       cwd: "~/projects/joyquant-sys",
     },
     {
@@ -1433,6 +1472,18 @@ function makeMockApp(): AppBindings {
     }
   };
   return {
+    async MinimiseMainWindow() {
+      console.info("mock MinimiseMainWindow");
+    },
+    async ToggleMaximiseMainWindow() {
+      console.info("mock ToggleMaximiseMainWindow");
+    },
+    async IsMainWindowMaximised() {
+      return false;
+    },
+    async CloseMainWindow() {
+      console.info("mock CloseMainWindow");
+    },
     async Platform() {
       const override = browserPlatformOverride();
       if (override) return override;
@@ -1654,6 +1705,9 @@ function makeMockApp(): AppBindings {
         async SubmitDisplayToTab(_tabID, display, input) {
           await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
         },
+        async SubmitEditedDisplayToTab(_tabID, display, input, _original) {
+          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
+        },
         async RunShell(command) {
           cancelled = false;
           emitMockTurnStarted();
@@ -1801,7 +1855,7 @@ function makeMockApp(): AppBindings {
         async ClearSession() {},
     async Checkpoints() {
       return [
-        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], turnFileCount: 1, time: Date.now() - 30_000, canCode: true, canConversation: true },
+        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], fileCount: 1, turnFileCount: 1, time: Date.now() - 30_000, canCode: true, canConversation: true },
       ];
     },
     async CheckpointsForTab() {
@@ -2005,6 +2059,7 @@ function makeMockApp(): AppBindings {
             tokenMode: normalizeTokenMode(active?.tokenMode),
             goal: active?.goal ?? "",
             goalStatus: active?.goalStatus ?? (active?.goal ? "running" : "stopped"),
+            autoResearch: active?.goal ? { taskId: "mock-autoresearch", status: "running", iteration: 4, pivotRequired: false, staleCount: 0 } : undefined,
           };
         },
         async MetaForTab(tabID) {
@@ -2030,7 +2085,79 @@ function makeMockApp(): AppBindings {
             tokenMode: normalizeTokenMode(tab?.tokenMode),
             goal: tab?.goal ?? "",
             goalStatus: tab?.goalStatus ?? (tab?.goal ? "running" : "stopped"),
+            autoResearch: tab?.goal ? { taskId: "mock-autoresearch", status: "running", iteration: 4, pivotRequired: false, staleCount: 0 } : undefined,
           };
+        },
+        async AutoResearchCurrent() {
+          return {
+            taskId: "mock-autoresearch",
+            goal: "Mock long-running research",
+            status: "running",
+            iteration: 4,
+            currentDirection: "Inspect status chip",
+            staleCount: 0,
+            pivotCount: 0,
+            pivotRequired: false,
+            lastHeartbeatAt: "2026-06-29T00:00:00Z",
+            findingCount: 1,
+            openCriteria: [],
+            blocker: "",
+            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
+            nextRequiredAction: "continue with the next evidence-producing step",
+          };
+        },
+        async AutoResearchStatus(_tabID) {
+          return {
+            taskId: "mock-autoresearch",
+            goal: "Mock long-running research",
+            status: "running",
+            iteration: 4,
+            currentDirection: "Inspect status chip",
+            staleCount: 0,
+            pivotCount: 0,
+            pivotRequired: false,
+            lastHeartbeatAt: "2026-06-29T00:00:00Z",
+            findingCount: 1,
+            openCriteria: [],
+            blocker: "",
+            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
+            nextRequiredAction: "continue with the next evidence-producing step",
+          };
+        },
+        async AutoResearchList(_tabID) {
+          return [{
+            taskId: "mock-autoresearch",
+            goal: "Mock long-running research",
+            status: "running",
+            iteration: 4,
+            currentDirection: "Inspect status chip",
+            staleCount: 0,
+            pivotCount: 0,
+            pivotRequired: false,
+            lastHeartbeatAt: "2026-06-29T00:00:00Z",
+            findingCount: 1,
+            openCriteria: [],
+            blocker: "",
+            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
+            nextRequiredAction: "continue with the next evidence-producing step",
+          }];
+        },
+        async AutoResearchFindings(_tabID, limit) {
+          return [{
+            id: "f1",
+            kind: "test",
+            summary: "Mock accepted finding",
+            source: "command",
+            command: "go test ./...",
+            accepted: true,
+            createdAt: "2026-06-29T00:00:00Z",
+          }].slice(0, Math.max(0, limit || 1));
+        },
+        async AutoResearchOpenTask(_tabID) {
+          console.info("mock AutoResearchOpenTask");
+        },
+        async AutoResearchRecordEvidence(_tabID, _criterionID, _input) {
+          console.info("mock AutoResearchRecordEvidence");
         },
     async Commands() {
       return [
@@ -2040,6 +2167,7 @@ function makeMockApp(): AppBindings {
         { name: "model", description: "Switch model", kind: "builtin" as const },
         { name: "effort", description: "Set reasoning effort", kind: "builtin" as const },
         { name: "skill", description: "List skills", kind: "builtin" as const },
+        { name: "plugins", description: "Manage plugin packages", kind: "builtin" as const },
         { name: "explore", description: "Investigate the codebase in an isolated subagent", kind: "skill" as const },
         { name: "review", description: "Review the staged diff", hint: "[focus]", kind: "custom" as const },
       ];
@@ -2049,6 +2177,7 @@ function makeMockApp(): AppBindings {
         servers: capServers.map((s) => ({ ...s })),
         skills: capSkills.map((s) => ({ ...s })),
         skillRoots: capSkillRoots.map((s) => ({ ...s })),
+        plugins: capPlugins.map((p) => ({ ...p })),
       };
     },
     async MCPServers() {
@@ -2058,6 +2187,59 @@ function makeMockApp(): AppBindings {
       return {
         skills: capSkills.map((s) => ({ ...s })),
         skillRoots: capSkillRoots.map((s) => ({ ...s })),
+      };
+    },
+    async Plugins() {
+      return capPlugins.map((p) => ({ ...p }));
+    },
+    async PlanPluginInstall(source: string, options: PluginInstallOptions) {
+      const name = options.name || source.split("/").filter(Boolean).pop()?.replace(/\.git$/, "") || "plugin";
+      return JSON.stringify({
+        ok: true,
+        status: "planned",
+        kind: "plugin",
+        actions: [{ kind: "plugin", action: "install_plugin_package", name, source, status: "planned" }],
+      });
+    },
+    async InstallPlugin(source: string, options: PluginInstallOptions) {
+      const name = options.name || source.split("/").filter(Boolean).pop()?.replace(/\.git$/, "") || "plugin";
+      const existing = capPlugins.findIndex((p) => p.name === name);
+      const view: PluginView = {
+        name,
+        version: "dev",
+        description: "Mock plugin",
+        source,
+        root: `~/.reasonix/plugins/${name}`,
+        manifestKind: "reasonix",
+        enabled: true,
+        skills: 1,
+        hooks: 0,
+        mcpServers: 0,
+        skillDetails: [{ name: "plan", description: "Plan work before implementation", invocation: "/plan", runAs: "inline" }],
+      };
+      if (existing >= 0) capPlugins[existing] = view;
+      else capPlugins.push(view);
+      return JSON.stringify({ ok: true, status: "done", kind: "plugin", actions: [{ kind: "plugin", name }] });
+    },
+    async RemovePlugin(name: string) {
+      capPlugins = capPlugins.filter((p) => p.name !== name);
+    },
+    async SetPluginEnabled(name: string, enabled: boolean) {
+      capPlugins = capPlugins.map((p) => p.name === name ? { ...p, enabled } : p);
+    },
+    async UpdatePlugin(name: string) {
+      capPlugins = capPlugins.map((p) => p.name === name ? { ...p, version: p.version || "dev" } : p);
+      return JSON.stringify({ ok: true, status: "done", kind: "plugin", name });
+    },
+    async PluginDoctor(name: string) {
+      return capPlugins.find((p) => p.name === name) || {
+        name,
+        root: "",
+        enabled: false,
+        skills: 0,
+        hooks: 0,
+        mcpServers: 0,
+        error: "plugin is not installed",
       };
     },
     async AddMCPServer(input: MCPServerInput) {
@@ -2165,6 +2347,9 @@ function makeMockApp(): AppBindings {
     },
     async PickSkillFolder() {
       return "~/my-skills";
+    },
+    async PickPluginFolder() {
+      return "~/plugins/superpowers";
     },
     async AddSkillPath(path: string) {
       const dir = path.trim() || "~/my-skills";
@@ -2572,6 +2757,9 @@ function makeMockApp(): AppBindings {
     async SetSubagentEffort(level: string) {
       settings.subagentEffort = level;
     },
+    async SetMaxSubagentDepth(depth: number) {
+      settings.agent = { ...settings.agent, maxSubagentDepth: depth <= 1 ? 1 : 2 };
+    },
     async SetAutoPlan(mode: string) {
       settings.autoPlan = mode;
     },
@@ -2759,6 +2947,15 @@ function makeMockApp(): AppBindings {
         },
         async SetDesktopLayoutStyle(style: string) {
           settings.desktopLayoutStyle = style === "workbench" || style === "creation" ? style : "classic";
+        },
+        async SetDesktopZoomFactor(_factor: number) {
+          // no-op in mock; in production this writes desktop-zoom.json via Go
+        },
+        async GetDesktopZoomFactor() {
+          return 1.0; // default in mock
+        },
+        async RestartApplication() {
+          // no-op in mock
         },
         async SetDesktopCheckUpdates(enabled: boolean) {
           settings.checkUpdates = enabled;

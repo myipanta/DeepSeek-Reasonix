@@ -58,6 +58,7 @@ type Asker interface {
 // callContextKey carries the executing tool call's identity into Execute.
 type callContextKey struct{}
 type parentSessionContextKey struct{}
+type subagentDepthContextKey struct{}
 type userImagesContextKey struct{}
 
 // callContext is the per-call context a tool can read. parentID is the call being
@@ -108,6 +109,24 @@ func ParentSession(ctx context.Context) string {
 	return strings.TrimSpace(parentSession)
 }
 
+// WithSubagentDepth carries the current subagent depth through nested tool calls.
+// The root agent runs at depth 0; each spawned subagent increments by one.
+func WithSubagentDepth(ctx context.Context, depth int) context.Context {
+	if depth < 0 {
+		depth = 0
+	}
+	return context.WithValue(ctx, subagentDepthContextKey{}, depth)
+}
+
+// SubagentDepth returns the current subagent depth carried by a turn context.
+func SubagentDepth(ctx context.Context) int {
+	depth, _ := ctx.Value(subagentDepthContextKey{}).(int)
+	if depth < 0 {
+		return 0
+	}
+	return depth
+}
+
 // WithUserImages carries the data URLs of images the user attached to this turn,
 // resolved by the controller (which owns attachments) since the agent must not
 // depend on it. Run embeds them on the user message; the provider sends them only
@@ -147,6 +166,22 @@ type PlanModeReadOnlyTrustRequest struct {
 // plan-mode check runs before ordinary permission policy.
 type PlanModeReadOnlyTrustGate interface {
 	CheckPlanModeReadOnlyTrust(ctx context.Context, req PlanModeReadOnlyTrustRequest) (allow bool, reason string, err error)
+}
+
+const (
+	MemoryCompilerVerbosityObserve = "observe"
+	MemoryCompilerVerbosityCompact = "compact"
+)
+
+const DefaultMaxSubagentDepth = 2
+
+// NormalizeMaxSubagentDepth applies the public config contract: values below 1
+// preserve the old single-delegation boundary.
+func NormalizeMaxSubagentDepth(depth int) int {
+	if depth < 1 {
+		return 1
+	}
+	return depth
 }
 
 // ToolHooks fires user-configured shell hooks around each tool call. PreToolUse
@@ -290,7 +325,10 @@ type Agent struct {
 	// system prompt or tool schema.
 	memoryCompilerMu sync.RWMutex
 	memoryCompiler   *memorycompiler.Runtime
-	compilerTurn     *memorycompiler.Turn
+	// observe is the default: Memory v5 writes traces without adding a
+	// provider-visible execution contract. compact preserves the old injection.
+	memoryCompilerVerbosity string
+	compilerTurn            *memorycompiler.Turn
 
 	// compilerInjectionMu bounds how often Memory v5 may replace a visible user
 	// turn with an execution contract. The runtime can still observe throttled
@@ -308,6 +346,11 @@ type Agent struct {
 	// Populated from Options.PlanModeAllowedTools during construction.
 	planModeAllowedTools []string
 
+	// subagentDepth tracks the current agent's nesting depth. maxSubagentDepth
+	// caps delegation; when reached, recursive agent/skill tools are excluded.
+	subagentDepth    int
+	maxSubagentDepth int
+
 	// Context management: when a turn's prompt nears contextWindow, the older
 	// middle of the session is summarized away, keeping a token-bounded recent
 	// tail verbatim (recentKeep is the message floor) and archiving the originals
@@ -317,6 +360,7 @@ type Agent struct {
 	// notice so it fires once per approach, not every turn.
 	contextWindow       int
 	softCompactRatio    float64
+	toolResultSnipRatio float64
 	compactRatio        float64
 	compactForceRatio   float64
 	softCompactNoticed  bool
@@ -402,6 +446,16 @@ func (a *Agent) SetMemoryCompiler(rt *memorycompiler.Runtime) {
 	a.resetMemoryCompilerInjectionGate()
 }
 
+func (a *Agent) SetMemoryCompilerVerbosity(verbosity string) {
+	if a == nil {
+		return
+	}
+	a.memoryCompilerMu.Lock()
+	a.memoryCompilerVerbosity = normalizeMemoryCompilerVerbosity(verbosity)
+	a.memoryCompilerMu.Unlock()
+	a.resetMemoryCompilerInjectionGate()
+}
+
 func (a *Agent) memoryCompilerRuntime() *memorycompiler.Runtime {
 	if a == nil {
 		return nil
@@ -409,6 +463,24 @@ func (a *Agent) memoryCompilerRuntime() *memorycompiler.Runtime {
 	a.memoryCompilerMu.RLock()
 	defer a.memoryCompilerMu.RUnlock()
 	return a.memoryCompiler
+}
+
+func (a *Agent) memoryCompilerShouldInject() bool {
+	if a == nil {
+		return false
+	}
+	a.memoryCompilerMu.RLock()
+	defer a.memoryCompilerMu.RUnlock()
+	return normalizeMemoryCompilerVerbosity(a.memoryCompilerVerbosity) == MemoryCompilerVerbosityCompact
+}
+
+func normalizeMemoryCompilerVerbosity(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "compact", "inject", "injected", "contract", "on":
+		return MemoryCompilerVerbosityCompact
+	default:
+		return MemoryCompilerVerbosityObserve
+	}
 }
 
 // clearClassifierCache 清除 LLM 分类器的缓存（在会话边界调用）
@@ -679,13 +751,14 @@ type Options struct {
 
 	// Context management. ContextWindow <= 0 disables compaction. Ratios and
 	// RecentKeep fall back to defaults when unset.
-	ContextWindow     int
-	SoftCompactRatio  float64
-	CompactRatio      float64
-	CompactForceRatio float64
-	RecentKeep        int
-	ArchiveDir        string
-	KeepPolicy        KeepPolicy
+	ContextWindow       int
+	SoftCompactRatio    float64
+	ToolResultSnipRatio float64
+	CompactRatio        float64
+	CompactForceRatio   float64
+	RecentKeep          int
+	ArchiveDir          string
+	KeepPolicy          KeepPolicy
 
 	// Hooks fires PreToolUse / PostToolUse shell hooks around tool calls. nil
 	// disables hook firing.
@@ -709,9 +782,17 @@ type Options struct {
 	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
 	PlanModeAllowedTools []string
 
+	// SubagentDepth is the current nesting depth for this agent. Root sessions are
+	// depth 0; child subagents are depth 1. MaxSubagentDepth caps delegation.
+	SubagentDepth    int
+	MaxSubagentDepth int
+
 	// MemoryCompiler enables Memory v5 execution trace writeback and cache-safe
 	// execution-contract compilation.
 	MemoryCompiler *memorycompiler.Runtime
+	// MemoryCompilerVerbosity controls provider-visible injection. Empty defaults
+	// to observe; compact restores the execution-contract user-turn injection.
+	MemoryCompilerVerbosity string
 
 	// UseMemoryCompilerLLMClassification 启用 LLM 分类来判断任务 vs 聊天
 	// 默认 false 时使用启发式分类器
@@ -726,8 +807,14 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if opts.SoftCompactRatio <= 0 {
 		opts.SoftCompactRatio = defaultSoftCompactRatio
 	}
+	if opts.ToolResultSnipRatio <= 0 {
+		opts.ToolResultSnipRatio = defaultToolResultSnipRatio
+	}
 	if opts.CompactRatio <= 0 {
 		opts.CompactRatio = defaultCompactRatio
+	}
+	if opts.ToolResultSnipRatio >= opts.CompactRatio {
+		opts.ToolResultSnipRatio = opts.CompactRatio
 	}
 	if opts.CompactForceRatio <= 0 {
 		opts.CompactForceRatio = defaultCompactForceRatio
@@ -754,31 +841,45 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if strings.TrimSpace(maxStepsKey) == "" {
 		maxStepsKey = "agent.max_steps"
 	}
+	maxSubagentDepth := opts.MaxSubagentDepth
+	if maxSubagentDepth == 0 {
+		maxSubagentDepth = DefaultMaxSubagentDepth
+	} else {
+		maxSubagentDepth = NormalizeMaxSubagentDepth(maxSubagentDepth)
+	}
+	subagentDepth := opts.SubagentDepth
+	if subagentDepth < 0 {
+		subagentDepth = 0
+	}
 	a := &Agent{
-		prov:                  prov,
-		tools:                 tools,
-		session:               session,
-		maxSteps:              opts.MaxSteps,
-		maxStepsKey:           maxStepsKey,
-		temperature:           opts.Temperature,
-		pricing:               opts.Pricing,
-		usageSource:           usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
-		sink:                  sink,
-		gate:                  gate,
-		planModeReadOnlyTrust: planModeReadOnlyTrust,
-		hooks:                 hooks,
-		jobs:                  opts.Jobs,
-		evidence:              evidence.NewLedger(),
-		projectChecks:         append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
-		contextWindow:         opts.ContextWindow,
-		softCompactRatio:      opts.SoftCompactRatio,
-		compactRatio:          opts.CompactRatio,
-		compactForceRatio:     opts.CompactForceRatio,
-		recentKeep:            opts.RecentKeep,
-		archiveDir:            opts.ArchiveDir,
-		keepPolicy:            opts.KeepPolicy,
-		planModeAllowedTools:  append([]string(nil), opts.PlanModeAllowedTools...),
-		memoryCompiler:        opts.MemoryCompiler,
+		prov:                    prov,
+		tools:                   tools,
+		session:                 session,
+		maxSteps:                opts.MaxSteps,
+		maxStepsKey:             maxStepsKey,
+		temperature:             opts.Temperature,
+		pricing:                 opts.Pricing,
+		usageSource:             usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
+		sink:                    sink,
+		gate:                    gate,
+		planModeReadOnlyTrust:   planModeReadOnlyTrust,
+		hooks:                   hooks,
+		jobs:                    opts.Jobs,
+		evidence:                evidence.NewLedger(),
+		projectChecks:           append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
+		contextWindow:           opts.ContextWindow,
+		softCompactRatio:        opts.SoftCompactRatio,
+		toolResultSnipRatio:     opts.ToolResultSnipRatio,
+		compactRatio:            opts.CompactRatio,
+		compactForceRatio:       opts.CompactForceRatio,
+		recentKeep:              opts.RecentKeep,
+		archiveDir:              opts.ArchiveDir,
+		keepPolicy:              opts.KeepPolicy,
+		planModeAllowedTools:    append([]string(nil), opts.PlanModeAllowedTools...),
+		subagentDepth:           subagentDepth,
+		maxSubagentDepth:        maxSubagentDepth,
+		memoryCompiler:          opts.MemoryCompiler,
+		memoryCompilerVerbosity: normalizeMemoryCompilerVerbosity(opts.MemoryCompilerVerbosity),
 	}
 	// 初始化分类器
 	if opts.UseMemoryCompilerLLMClassification && prov != nil {
@@ -840,6 +941,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		if isTask {
 			if compiledInput, turn := memCompiler.StartTurn(ctx, memoryCompilerInput, a.session.Snapshot()); turn != nil {
 				injected := strings.TrimSpace(compiledInput) != "" &&
+					a.memoryCompilerShouldInject() &&
 					a.tryMarkMemoryCompilerInjected(time.Now())
 				if !injected {
 					turn.SuppressInjection()
@@ -1751,6 +1853,7 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 				Output:     o.output,
 				Error:      o.errMsg,
 				ReadOnly:   ok && t.ReadOnly(),
+				Blocked:    o.blocked,
 				DurationMs: durations[i],
 				Truncated:  o.truncated,
 			})
@@ -1964,6 +2067,13 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			errMsg:  "blocked by loop guard",
 		}
 	}
+	if out, blocked := a.staleAnchorEditBlock(call); blocked {
+		return toolOutcome{
+			output:  out,
+			blocked: true,
+			errMsg:  "blocked: fresh read required",
+		}
+	}
 	if a.planMode.Load() {
 		// Translate the tool's optional plan-mode self-report into the policy's
 		// tri-state. Mirrors the t.(tool.Previewer) assertion precedent below.
@@ -2043,6 +2153,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 		}
 	}
 	cctx := withCallContext(ctx, call.ID, a.sink, a.asker, a.planMode.Load())
+	cctx = WithSubagentDepth(cctx, a.subagentDepth)
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)
 		cctx = evidence.WithSessionMessages(cctx, a.session.Snapshot())
@@ -2189,6 +2300,32 @@ func (a *Agent) repeatedSuccessBlock(call provider.ToolCall, t tool.Tool) (strin
 	return fmt.Sprintf(
 		"blocked: [loop guard] %q has already succeeded %d times with the same write-like arguments in this user turn. Re-running it is unlikely to help and may burn tokens or repeat file writes. Change approach: use edit_file or multi_edit for file changes, verify with a read/test command, or explain the blocker in your final answer.",
 		call.Name, count), true
+}
+
+func (a *Agent) staleAnchorEditBlock(call provider.ToolCall) (string, bool) {
+	if a.evidence == nil || !anchorBasedEditTool(call.Name) {
+		return "", false
+	}
+	rec := evidence.ReceiptFromToolCall(call.Name, json.RawMessage(call.Arguments), true, false)
+	if len(rec.Paths) == 0 {
+		return "", false
+	}
+	writeIndex, ok := a.evidence.LatestSuccessfulWriteIndex(rec.Paths)
+	if !ok || a.evidence.HasSuccessfulAnchorRefreshReadAfter(rec.Paths, writeIndex) {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"blocked: [fresh read required] %q targets %s, which was already modified earlier this turn. Re-read the current file with read_file without offset/limit before another anchor-based edit, or combine the final same-file changes in one multi_edit call. This prevents stale old_string anchors and half-deleted ranges.",
+		call.Name, strings.Join(rec.Paths, ", ")), true
+}
+
+func anchorBasedEditTool(name string) bool {
+	switch name {
+	case "edit_file", "delete_range":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *Agent) recordRepeatSuccess(call provider.ToolCall, t tool.Tool) {

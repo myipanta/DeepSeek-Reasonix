@@ -248,6 +248,33 @@ func TestClearSessionMarksCleanupPendingBeforeReturningForRunningJobs(t *testing
 	}
 }
 
+func TestClearSessionQueuesSessionStartHookContext(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.jsonl")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte(`{"role":"user","content":"old"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	hooks := hook.NewRunner([]hook.ResolvedHook{{
+		HookConfig: hook.HookConfig{Command: "session-start"},
+		Event:      hook.SessionStart,
+	}}, dir, func(context.Context, hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{ExitCode: 0, Stdout: "clear session context"}
+	}, nil)
+	c := New(Options{Executor: exec, SystemPrompt: "sys", SessionDir: dir, SessionPath: oldPath, Label: "test", Hooks: hooks})
+
+	if err := c.ClearSession(); err != nil {
+		t.Fatalf("ClearSession: %v", err)
+	}
+	got := c.Compose("next")
+	if !strings.Contains(got, `<hook-context event="SessionStart">`) || !strings.Contains(got, "clear session context") || !strings.HasSuffix(got, "next") {
+		t.Fatalf("clear session did not queue SessionStart hook context: %q", got)
+	}
+}
+
 func TestReconcileCleanupPendingRemovesOrphanedArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "orphan.jsonl")
@@ -480,6 +507,52 @@ func TestResumeKeepsTranscriptTodosForRunningGoalSidecar(t *testing.T) {
 	}
 }
 
+func TestResumeRestoresRunningAutoResearchGoalFromSidecar(t *testing.T) {
+	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	path := filepath.Join(root, "session.jsonl")
+	taskID := "investigate-runtime-resume"
+	if err := os.MkdirAll(filepath.Join(root, ".reasonix", "autoresearch", taskID, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".reasonix", "autoresearch", taskID, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".reasonix", "autoresearch", taskID, "state", "task_spec.json"), []byte(`{"id":"investigate-runtime-resume","goal":"investigate runtime resume","status":"running","created_at":"2026-06-30T00:00:00Z","updated_at":"2026-06-30T00:00:00Z","success_criteria":[{"id":"criterion-1","description":"resume keeps AutoResearch active","required":true}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".reasonix", "autoresearch", taskID, "state", "progress.json"), []byte(`{"task_id":"investigate-runtime-resume","iteration":2,"current_direction":"verify resume","stale_count":1,"pivot_count":0,"updated_at":"2026-06-30T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".reasonix", "autoresearch", taskID, "state", "directions_tried.json"), []byte(`{"task_id":"investigate-runtime-resume","directions":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".reasonix", "autoresearch", taskID, "state", "findings.jsonl"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".reasonix", "autoresearch", taskID, "logs", "heartbeat.jsonl"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goalStatePath(path), []byte(`{"goal":"investigate runtime resume","status":"running","researchMode":1,"autoResearchTaskID":"investigate-runtime-resume"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := agent.NewSession("sys")
+	exec := agent.New(nil, nil, loaded, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, WorkspaceRoot: root, SessionDir: root, Label: "test"})
+	c.Resume(loaded, path)
+
+	if got := c.Goal(); got != "investigate runtime resume" {
+		t.Fatalf("Goal() after resume = %q, want running goal from sidecar", got)
+	}
+	composed := c.Compose("continue")
+	if !strings.Contains(composed, "<autoresearch-runtime>") || !strings.Contains(composed, "task_id: "+taskID) {
+		t.Fatalf("Compose after resume missing AutoResearch runtime for %q:\n%s", taskID, composed)
+	}
+}
+
 func TestRunTurnRecordsDisplayForPersistedUserMessage(t *testing.T) {
 	sess := agent.NewSession("sys")
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
@@ -615,6 +688,27 @@ func TestNewSessionStartsFreshContextAndSavesTranscript(t *testing.T) {
 	current := exec.Session().Snapshot()
 	if len(current) != 1 || current[0].Role != provider.RoleSystem || current[0].Content != "sys" {
 		t.Fatalf("fresh context = %+v, want only system prompt", current)
+	}
+}
+
+func TestNewSessionQueuesSessionStartHookContext(t *testing.T) {
+	dir := t.TempDir()
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	path := filepath.Join(dir, "session.jsonl")
+	hooks := hook.NewRunner([]hook.ResolvedHook{{
+		HookConfig: hook.HookConfig{Command: "session-start"},
+		Event:      hook.SessionStart,
+	}}, dir, func(context.Context, hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{ExitCode: 0, Stdout: "new session context"}
+	}, nil)
+	c := New(Options{Executor: exec, SystemPrompt: "sys", SessionDir: dir, SessionPath: path, Label: "test", Hooks: hooks})
+
+	if err := c.NewSession(); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	got := c.Compose("next")
+	if !strings.Contains(got, `<hook-context event="SessionStart">`) || !strings.Contains(got, "new session context") || !strings.HasSuffix(got, "next") {
+		t.Fatalf("new session did not queue SessionStart hook context: %q", got)
 	}
 }
 
@@ -785,7 +879,7 @@ func TestSubmitClearDiscardsCurrentContextWithoutSavingTranscript(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	c.submit("/clear", "")
+	c.submit("/clear", "", "")
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && c.SessionPath() == path {
 		time.Sleep(time.Millisecond)

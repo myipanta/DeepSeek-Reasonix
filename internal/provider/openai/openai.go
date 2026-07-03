@@ -62,6 +62,10 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	}
 	protocol, _ := cfg.Extra["reasoning_protocol"].(string)
 	protocol = normalizeReasoningProtocol(protocol)
+	chatURL, _ := cfg.Extra["chat_url"].(string)
+	chatURL = normalizeChatURL(cfg.BaseURL, chatURL)
+	headers, _ := cfg.Extra["headers"].(map[string]string)
+	extraBody, _ := cfg.Extra["extra_body"].(map[string]any)
 	vision, _ := cfg.Extra["vision"].(bool)
 	visionDetail, _ := cfg.Extra["vision_detail"].(string)
 	visionDetail = strings.ToLower(strings.TrimSpace(visionDetail))
@@ -116,6 +120,9 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		keyEnv:       keyEnv,
 		keySource:    keySource,
 		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
+		chatURL:      chatURL,
+		headers:      cleanCustomHeaders(headers),
+		extraBody:    cleanExtraBody(extraBody),
 		model:        cfg.Model,
 		deepseek:     deepseek,
 		minimax:      minimax,
@@ -143,6 +150,9 @@ type client struct {
 	keyEnv       string // api_key_env name, surfaced in auth errors
 	keySource    string // source of keyEnv, surfaced in auth errors
 	baseURL      string
+	chatURL      string
+	headers      map[string]string
+	extraBody    map[string]any
 	model        string
 	http         *http.Client
 	deepseek     bool
@@ -175,6 +185,74 @@ func normalizeReasoningProtocol(raw string) string {
 	}
 }
 
+func normalizeChatURL(baseURL, chatURL string) string {
+	if trimmed := strings.TrimRight(strings.TrimSpace(chatURL), "/"); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/chat/completions"
+}
+
+func cleanCustomHeaders(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for rawName, rawValue := range in {
+		name := strings.TrimSpace(rawName)
+		value := strings.TrimSpace(rawValue)
+		if name == "" || value == "" || reservedCustomHeader(name) {
+			continue
+		}
+		out[name] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applyCustomHeaders(h http.Header, headers map[string]string) {
+	for name, value := range cleanCustomHeaders(headers) {
+		h.Set(name, value)
+	}
+}
+
+func cleanExtraBody(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for rawName, value := range in {
+		name := strings.TrimSpace(rawName)
+		if name == "" || reservedExtraBodyField(name) {
+			continue
+		}
+		out[name] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func reservedExtraBodyField(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "model", "messages", "tools", "stream", "stream_options", "temperature", "max_tokens", "reasoning_effort", "thinking":
+		return true
+	default:
+		return false
+	}
+}
+
+func reservedCustomHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "authorization", "content-type", "accept", "host":
+		return true
+	default:
+		return false
+	}
+}
+
 // bufPool reuses byte buffers for JSON-marshalled request bodies. Each turn
 // allocates a buffer, marshals the request, and sends it — pooling avoids the
 // GC churn from repeated alloc/free of ~10-100KB buffers. The pool is
@@ -195,7 +273,7 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	bufPool.Put(buf)
 
 	newReq := func(ctx context.Context) (*http.Request, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatURL, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -204,6 +282,7 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 		}
 		httpReq.Header.Set("Accept", "text/event-stream")
+		applyCustomHeaders(httpReq.Header, c.headers)
 		return httpReq, nil
 	}
 	resp, err := provider.SendWithRetry(ctx, c.http, c.sendOpts(), newReq)
@@ -318,6 +397,7 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		Temperature:     req.Temperature,
 		MaxTokens:       req.MaxTokens,
 		ReasoningEffort: c.effort,
+		ExtraBody:       c.extraBody,
 	}
 	switch {
 	case c.deepseek:
@@ -570,6 +650,28 @@ type chatRequest struct {
 	MaxTokens       int            `json:"max_tokens,omitempty"`
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 	Thinking        *thinkingMode  `json:"thinking,omitempty"`
+	ExtraBody       map[string]any `json:"-"`
+}
+
+func (r chatRequest) MarshalJSON() ([]byte, error) {
+	type wire chatRequest
+	baseReq := wire(r)
+	baseReq.ExtraBody = nil
+	raw, err := json.Marshal(baseReq)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.ExtraBody) == 0 {
+		return raw, nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, err
+	}
+	for key, value := range cleanExtraBody(r.ExtraBody) {
+		body[key] = value
+	}
+	return json.Marshal(body)
 }
 
 type thinkingMode struct {

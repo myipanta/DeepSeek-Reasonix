@@ -74,6 +74,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		} else {
 			b.WriteString("# shortcut_layout = \"desktop\"   # classic|desktop; compatibility setting; Shift+Tab toggles Plan, Ctrl+Y toggles YOLO\n")
 		}
+		if strings.TrimSpace(c.UI.CursorShape) != "" {
+			fmt.Fprintf(&b, "cursor_shape = %q   # block|underline|bar; text input cursor shape\n", c.UICursorShape())
+		} else {
+			b.WriteString("# cursor_shape = \"underline\"   # block|underline|bar; text input cursor shape\n")
+		}
 		if strings.TrimSpace(c.UI.CloseBehavior) != "" && scope == RenderScopeProject {
 			fmt.Fprintf(&b, "close_behavior = %q   # legacy desktop close behavior; prefer [desktop].close_behavior in user config\n", c.DesktopCloseBehavior())
 		}
@@ -162,6 +167,9 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		}
 		b.WriteString("\n")
 	}
+	if shouldRenderEnvironment(c, defaults, scope) {
+		renderEnvironmentConfig(&b, c.Environment)
+	}
 
 	b.WriteString("[agent]\n")
 	if shouldRenderSystemPrompt(c, defaults, scope) {
@@ -198,7 +206,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 			autoPlan = "off"
 		}
 		fmt.Fprintf(&b, "auto_plan   = %q   # user-level only: off|on; off keeps plan mode manual\n", autoPlan)
-		fmt.Fprintf(&b, "memory_compiler = { enabled = %v }   # user-level only: Memory v5 execution compiler\n", c.MemoryCompilerEnabled())
+		fmt.Fprintf(&b, "memory_compiler = { enabled = %v, verbosity = %q }   # user-level only: observe|compact\n", c.MemoryCompilerEnabled(), c.MemoryCompilerVerbosity())
 	}
 	if lang := c.ReasoningLanguage(); lang != "auto" {
 		fmt.Fprintf(&b, "reasoning_language = %q   # visible reasoning language: auto|zh|en\n", lang)
@@ -211,6 +219,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		b.WriteString("# auto_plan_classifier = \"deepseek-flash\"   # optional; only used for borderline tasks\n")
 	}
 	fmt.Fprintf(&b, "soft_compact_ratio  = %s   # notice only; keeps cache-first prefix intact\n", formatFloat(c.Agent.SoftCompactRatio))
+	fmt.Fprintf(&b, "tool_result_snip_ratio = %s   # snip stale tool results at this fraction before summary compaction\n", formatFloat(c.Agent.ToolResultSnipRatio))
 	fmt.Fprintf(&b, "compact_ratio       = %s   # try compacting when prompt reaches this fraction\n", formatFloat(c.Agent.CompactRatio))
 	fmt.Fprintf(&b, "compact_force_ratio = %s   # force compacting at this high-water mark\n", formatFloat(c.Agent.CompactForceRatio))
 	if c.Agent.Keep != nil {
@@ -254,6 +263,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# subagent_efforts = { review = \"max\", task = \"high\" }   # per-tool/skill effort overrides\n")
 	}
+	if c.Agent.MaxSubagentDepth != defaults.Agent.MaxSubagentDepth {
+		fmt.Fprintf(&b, "max_subagent_depth = %d   # nested subagent delegation depth; 1 restores the old single-layer boundary\n", c.Agent.MaxSubagentDepth)
+	} else {
+		b.WriteString("# max_subagent_depth = 2   # nested subagent delegation depth; set 1 to disable nested delegation\n")
+	}
 	if c.Agent.OutputStyle != "" {
 		fmt.Fprintf(&b, "output_style = %q   # persona/tone folded into the prompt\n", c.Agent.OutputStyle)
 	} else {
@@ -267,6 +281,9 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 			fmt.Fprintf(&b, "name        = %q\n", p.Name)
 			fmt.Fprintf(&b, "kind        = %q\n", p.Kind)
 			fmt.Fprintf(&b, "base_url    = %q\n", p.BaseURL)
+			if p.ChatURL != "" {
+				fmt.Fprintf(&b, "chat_url    = %q   # optional full chat completions URL; disables automatic /chat/completions suffix\n", p.ChatURL)
+			}
 			if len(p.Models) > 0 {
 				fmt.Fprintf(&b, "models      = %s\n", renderStringArray(p.Models))
 				if p.Default != "" {
@@ -279,6 +296,12 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 				fmt.Fprintf(&b, "models_url  = %q   # auto-fetch models from this URL on startup\n", p.ModelsURL)
 			}
 			fmt.Fprintf(&b, "api_key_env = %q\n", p.APIKeyEnv)
+			if len(p.Headers) > 0 {
+				fmt.Fprintf(&b, "headers     = %s   # extra static request headers; keep secrets in api_key_env\n", renderStringMap(p.Headers))
+			}
+			if len(p.ExtraBody) > 0 {
+				fmt.Fprintf(&b, "extra_body  = %s   # extra top-level JSON request body fields for compatible gateways\n", renderAnyMap(p.ExtraBody))
+			}
 			if p.BalanceURL != "" {
 				fmt.Fprintf(&b, "balance_url = %q   # optional; wallet-balance endpoint shown in the status bar\n", p.BalanceURL)
 			}
@@ -314,6 +337,9 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 			}
 			if p.DefaultEffort != "" {
 				fmt.Fprintf(&b, "default_effort    = %q   # used when /effort is auto or unset; must be one of supported_efforts\n", p.DefaultEffort)
+			}
+			if len(p.ModelOverrides) > 0 {
+				fmt.Fprintf(&b, "model_overrides   = %s   # per-model reasoning/vision overrides for mixed gateways\n", renderModelOverrides(p.ModelOverrides))
 			}
 			if p.NoProxy {
 				b.WriteString("no_proxy    = true   # reach this base_url directly, never via the proxy\n")
@@ -596,6 +622,9 @@ func RenderTOMLProjectDelta(c *Config) string {
 		if l := c.UIShortcutLayout(); l != "classic" {
 			fmt.Fprintf(&b, "shortcut_layout = %q\n", l)
 		}
+		if strings.TrimSpace(c.UI.CursorShape) != "" {
+			fmt.Fprintf(&b, "cursor_shape = %q\n", c.UICursorShape())
+		}
 		if c.UI.CloseBehavior != d.UI.CloseBehavior {
 			fmt.Fprintf(&b, "close_behavior = %q\n", c.DesktopCloseBehavior())
 		}
@@ -672,6 +701,10 @@ func RenderTOMLProjectDelta(c *Config) string {
 		fmt.Fprintf(&agentBuf, "soft_compact_ratio = %s\n", formatFloat(c.Agent.SoftCompactRatio))
 		anyAgent = true
 	}
+	if c.Agent.ToolResultSnipRatio != d.Agent.ToolResultSnipRatio {
+		fmt.Fprintf(&agentBuf, "tool_result_snip_ratio = %s\n", formatFloat(c.Agent.ToolResultSnipRatio))
+		anyAgent = true
+	}
 	if c.Agent.CompactRatio != d.Agent.CompactRatio {
 		fmt.Fprintf(&agentBuf, "compact_ratio = %s\n", formatFloat(c.Agent.CompactRatio))
 		anyAgent = true
@@ -716,6 +749,10 @@ func RenderTOMLProjectDelta(c *Config) string {
 		fmt.Fprintf(&agentBuf, "subagent_efforts = %s\n", renderStringMap(c.Agent.SubagentEfforts))
 		anyAgent = true
 	}
+	if c.Agent.MaxSubagentDepth != d.Agent.MaxSubagentDepth {
+		fmt.Fprintf(&agentBuf, "max_subagent_depth = %d\n", c.Agent.MaxSubagentDepth)
+		anyAgent = true
+	}
 	if c.Agent.OutputStyle != "" && c.Agent.OutputStyle != d.Agent.OutputStyle {
 		fmt.Fprintf(&agentBuf, "output_style = %q\n", c.Agent.OutputStyle)
 		anyAgent = true
@@ -735,6 +772,9 @@ func RenderTOMLProjectDelta(c *Config) string {
 			fmt.Fprintf(&b, "name        = %q\n", p.Name)
 			fmt.Fprintf(&b, "kind        = %q\n", p.Kind)
 			fmt.Fprintf(&b, "base_url    = %q\n", p.BaseURL)
+			if p.ChatURL != "" {
+				fmt.Fprintf(&b, "chat_url    = %q\n", p.ChatURL)
+			}
 			if len(p.Models) > 0 {
 				fmt.Fprintf(&b, "models      = %s\n", renderStringArray(p.Models))
 				if p.Default != "" {
@@ -747,6 +787,12 @@ func RenderTOMLProjectDelta(c *Config) string {
 				fmt.Fprintf(&b, "models_url  = %q\n", p.ModelsURL)
 			}
 			fmt.Fprintf(&b, "api_key_env = %q\n", p.APIKeyEnv)
+			if len(p.Headers) > 0 {
+				fmt.Fprintf(&b, "headers     = %s\n", renderStringMap(p.Headers))
+			}
+			if len(p.ExtraBody) > 0 {
+				fmt.Fprintf(&b, "extra_body  = %s\n", renderAnyMap(p.ExtraBody))
+			}
 			if p.BalanceURL != "" {
 				fmt.Fprintf(&b, "balance_url = %q\n", p.BalanceURL)
 			}
@@ -782,6 +828,9 @@ func RenderTOMLProjectDelta(c *Config) string {
 			}
 			if p.DefaultEffort != "" {
 				fmt.Fprintf(&b, "default_effort    = %q\n", p.DefaultEffort)
+			}
+			if len(p.ModelOverrides) > 0 {
+				fmt.Fprintf(&b, "model_overrides   = %s\n", renderModelOverrides(p.ModelOverrides))
 			}
 			if p.NoProxy {
 				b.WriteString("no_proxy    = true\n")
@@ -997,6 +1046,37 @@ func shouldRenderNetwork(c, defaults *Config, scope RenderScope) bool {
 	return !reflect.DeepEqual(c.Network, defaults.Network)
 }
 
+func shouldRenderEnvironment(c, defaults *Config, scope RenderScope) bool {
+	if scope != RenderScopeProject {
+		return true
+	}
+	return !reflect.DeepEqual(c.Environment, defaults.Environment)
+}
+
+func renderEnvironmentConfig(b *strings.Builder, cfg EnvironmentConfig) {
+	b.WriteString("[environment]\n")
+	enabled := true
+	if cfg.Enabled != nil {
+		enabled = *cfg.Enabled
+	}
+	fmt.Fprintf(b, "enabled = %v   # inject a stable startup environment summary into the model prompt\n", enabled)
+	if len(cfg.Tools) == 0 {
+		b.WriteString("# [environment.tools]\n")
+		b.WriteString("# go = \"/opt/homebrew/bin/go\"   # trusted executable path; workspace-local paths are not auto-executed\n\n")
+		return
+	}
+	b.WriteString("\n[environment.tools]\n")
+	names := make([]string, 0, len(cfg.Tools))
+	for name := range cfg.Tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(b, "%s = %q\n", renderTOMLKeyPart(name), cfg.Tools[name])
+	}
+	b.WriteString("\n")
+}
+
 func shouldRenderProviders(c, defaults *Config, scope RenderScope) bool {
 	if scope != RenderScopeProject {
 		return true
@@ -1128,6 +1208,128 @@ func renderStringMap(m map[string]string) string {
 	}
 	b.WriteString(" }")
 	return b.String()
+}
+
+func renderAnyMap(m map[string]any) string {
+	keys := make([]string, 0, len(m))
+	for k, v := range m {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		if _, ok := renderAnyValue(v); ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		value, _ := renderAnyValue(m[k])
+		fmt.Fprintf(&b, "%s = %s", strconv.Quote(k), value)
+	}
+	b.WriteString(" }")
+	return b.String()
+}
+
+func renderAnyValue(v any) (string, bool) {
+	switch x := v.(type) {
+	case nil:
+		return "", false
+	case string:
+		return strconv.Quote(x), true
+	case bool:
+		if x {
+			return "true", true
+		}
+		return "false", true
+	case int:
+		return strconv.Itoa(x), true
+	case int8:
+		return strconv.FormatInt(int64(x), 10), true
+	case int16:
+		return strconv.FormatInt(int64(x), 10), true
+	case int32:
+		return strconv.FormatInt(int64(x), 10), true
+	case int64:
+		return strconv.FormatInt(x, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint64:
+		return strconv.FormatUint(x, 10), true
+	case float32:
+		return formatFloat(float64(x)), true
+	case float64:
+		return formatFloat(x), true
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			part, ok := renderAnyValue(item)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, part)
+		}
+		return "[" + strings.Join(parts, ", ") + "]", true
+	case []string:
+		return renderStringArray(x), true
+	case map[string]any:
+		return renderAnyMap(x), true
+	case map[string]string:
+		return renderStringMap(x), true
+	default:
+		return "", false
+	}
+}
+
+func renderModelOverrides(m map[string]ProviderModelOverride) string {
+	keys := make([]string, 0, len(m))
+	for k, ov := range m {
+		if k == "" || modelOverrideEmpty(ov) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q = %s", k, renderModelOverride(m[k]))
+	}
+	b.WriteString(" }")
+	return b.String()
+}
+
+func renderModelOverride(ov ProviderModelOverride) string {
+	var parts []string
+	if ov.ReasoningProtocol != "" {
+		parts = append(parts, fmt.Sprintf("reasoning_protocol = %q", ov.ReasoningProtocol))
+	}
+	if len(ov.SupportedEfforts) > 0 {
+		parts = append(parts, "supported_efforts = "+renderStringArray(ov.SupportedEfforts))
+	}
+	if ov.DefaultEffort != "" {
+		parts = append(parts, fmt.Sprintf("default_effort = %q", ov.DefaultEffort))
+	}
+	if ov.Vision != nil {
+		parts = append(parts, fmt.Sprintf("vision = %t", *ov.Vision))
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
+func modelOverrideEmpty(ov ProviderModelOverride) bool {
+	return ov.ReasoningProtocol == "" && len(ov.SupportedEfforts) == 0 && ov.DefaultEffort == "" && ov.Vision == nil
 }
 
 func hasPositiveIntMap(m map[string]int) bool {

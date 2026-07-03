@@ -41,6 +41,7 @@ func TestSlashArgItems(t *testing.T) {
 		CurrentModel:    "deepseek-flash/deepseek-v4-flash",
 		ProviderNames:   []string{"deepseek-flash", "deepseek-pro", "custom"},
 		CurrentProvider: "deepseek-flash",
+		PluginNames:     []string{"superpowers", "workflow-kit"},
 	}
 
 	// /skills subcommands
@@ -160,8 +161,8 @@ func TestSlashArgItems(t *testing.T) {
 	}
 	// /memory-v5
 	items, _ = SlashArgItems("/memory-v5 ", data)
-	if !has(items, "status") || !has(items, "off") || !has(items, "on") {
-		t.Errorf("/memory-v5 should offer status/off/on; got %v", labelsOf(items))
+	if !has(items, "status") || !has(items, "off") || !has(items, "observe") || !has(items, "compact") || !has(items, "on") {
+		t.Errorf("/memory-v5 should offer status/off/observe/compact/on; got %v", labelsOf(items))
 	}
 	// /theme
 	items, _ = SlashArgItems("/theme ", data)
@@ -181,6 +182,15 @@ func TestSlashArgItems(t *testing.T) {
 	// handled by runSkillSubcommand.
 	if items, _ := SlashArgItems("/skills li", data); len(items) != 0 {
 		t.Errorf("/skills li should not offer hidden list suggestion; got %v", labelsOf(items))
+	}
+	// /plugins mirrors the session-facing plugin inventory command.
+	items, _ = SlashArgItems("/plugins ", data)
+	if !has(items, "show") {
+		t.Errorf("/plugins should offer show; got %v", labelsOf(items))
+	}
+	items, _ = SlashArgItems("/plugins show ", data)
+	if !has(items, "superpowers") || !has(items, "workflow-kit") {
+		t.Errorf("/plugins show should list plugin names; got %v", labelsOf(items))
 	}
 }
 
@@ -259,6 +269,9 @@ func TestManagementMemoryV5WritesUserConfig(t *testing.T) {
 	cfg := config.LoadForEdit(config.UserConfigPath())
 	if cfg.MemoryCompilerEnabled() {
 		t.Fatal("memory_compiler.enabled = true, want false")
+	}
+	if got := cfg.MemoryCompilerVerbosity(); got != config.MemoryCompilerVerbosityObserve {
+		t.Fatalf("memory_compiler.verbosity = %q, want observe", got)
 	}
 	if !strings.Contains(strings.Join(notices, "\n"), "memory-v5 set to off") {
 		t.Fatalf("missing memory-v5 notice: %v", notices)

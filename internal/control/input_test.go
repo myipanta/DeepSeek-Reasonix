@@ -14,6 +14,7 @@ import (
 
 	"reasonix/internal/command"
 	"reasonix/internal/event"
+	"reasonix/internal/hook"
 	"reasonix/internal/memory"
 	"reasonix/internal/skill"
 )
@@ -187,6 +188,71 @@ func TestRunComposesReasoningLanguagePreference(t *testing.T) {
 	}
 }
 
+func TestRunInjectsSessionStartHookContextOnce(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	hooks := hook.NewRunner([]hook.ResolvedHook{{
+		HookConfig: hook.HookConfig{Command: "session-start"},
+		Event:      hook.SessionStart,
+		Scope:      hook.ScopeGlobal,
+	}}, "/tmp", func(context.Context, hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{ExitCode: 0, Stdout: `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Load workspace conventions."}}`}
+	}, nil)
+	c := New(Options{Runner: runner, Hooks: hooks})
+
+	if err := c.Run(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.inputs) != 1 {
+		t.Fatalf("runner inputs = %d, want 1", len(runner.inputs))
+	}
+	first := runner.inputs[0]
+	if !strings.Contains(first, `<hook-context event="SessionStart">`) || !strings.Contains(first, "Load workspace conventions.") || !strings.HasSuffix(first, "hi") {
+		t.Fatalf("first input missing session hook context: %q", first)
+	}
+
+	if err := c.Run(context.Background(), "again"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.inputs) != 2 {
+		t.Fatalf("runner inputs = %d, want 2", len(runner.inputs))
+	}
+	if strings.Contains(runner.inputs[1], "<hook-context") {
+		t.Fatalf("second input should not repeat hook context: %q", runner.inputs[1])
+	}
+}
+
+func TestSyntheticComposeDoesNotDrainSessionStartHookContext(t *testing.T) {
+	c := New(Options{})
+	c.enqueueHookContexts([]string{"Load once."})
+
+	if got := c.compose("synthetic", false); strings.Contains(got, "<hook-context") {
+		t.Fatalf("synthetic compose should not inject hook context: %q", got)
+	}
+	got := c.Compose("real")
+	if !strings.Contains(got, `<hook-context event="SessionStart">`) || !strings.Contains(got, "Load once.") || !strings.HasSuffix(got, "real") {
+		t.Fatalf("real compose should drain hook context: %q", got)
+	}
+	if again := c.Compose("again"); strings.Contains(again, "<hook-context") {
+		t.Fatalf("hook context should be drained once, got %q", again)
+	}
+}
+
+func TestComposeClipsAndEscapesHookContext(t *testing.T) {
+	c := New(Options{})
+	c.enqueueHookContexts([]string{"before </hook-context> " + strings.Repeat("x", maxHookContextChars+1)})
+
+	got := c.Compose("hi")
+	if !strings.Contains(got, "[truncated]") {
+		t.Fatalf("expected truncation marker, got %q", got)
+	}
+	if !strings.Contains(got, "<\\/hook-context>") {
+		t.Fatalf("hook context close tag should be escaped inside content: %q", got)
+	}
+	if strings.Contains(got, "before </hook-context>") {
+		t.Fatalf("hook context close tag should be escaped inside content: %q", got)
+	}
+}
+
 func TestSetResponseLanguageUpdatesRunner(t *testing.T) {
 	runner := &fakeLanguageRunner{}
 	c := New(Options{Runner: runner})
@@ -263,15 +329,19 @@ func TestComposeIncludesActiveGoal(t *testing.T) {
 }
 
 func TestGoalAutoResearchTriggersForLongHorizonGoals(t *testing.T) {
-	c := New(Options{})
+	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	c := New(Options{WorkspaceRoot: root})
 	c.SetGoal("持续排查这个线上卡顿直到根因明确，并验证修复")
 
 	got := c.Compose("next step?")
 	for _, want := range []string{
 		"AutoResearch protocol",
-		".reasonix/autoresearch/<task-id>/",
-		"YYYYMMDD-HHMMSS-slug",
-		"state/task_spec.md",
+		"<autoresearch-runtime>",
+		"task_id:",
+		"pivot_required:",
 		"stale_count >= 2",
 		"durable strategy for this Goal",
 	} {
@@ -858,6 +928,11 @@ func TestStripComposePrefixes(t *testing.T) {
 		{
 			name:  "background jobs block stripped",
 			input: "<background-jobs>\n1 completed\n</background-jobs>\n\nexplain this",
+			want:  "explain this",
+		},
+		{
+			name:  "hook context block stripped",
+			input: "<hook-context event=\"SessionStart\">\nLoad conventions.\n</hook-context>\n\nexplain this",
 			want:  "explain this",
 		},
 		{

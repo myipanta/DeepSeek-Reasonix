@@ -538,6 +538,9 @@ func TestClearCommandRequiresConfirmationAndDiscardsSession(t *testing.T) {
 	}
 
 	m.runSlashCommand("/clear")
+	m.shellOutputs["shell-old"] = "old shell output\n"
+	m.shellExpanded["shell-old"] = true
+	m.shellTranscriptIdx["shell-old"] = 2
 	next, _ = m.handleClearConfirmKey(tea.KeyPressMsg{Code: 'y'})
 	m = next.(chatTUI)
 	if ctrl.SessionPath() == path {
@@ -552,6 +555,51 @@ func TestClearCommandRequiresConfirmationAndDiscardsSession(t *testing.T) {
 	}
 	if len(m.transcript) == 0 || strings.Contains(strings.Join(m.transcript, "\n"), "old context") {
 		t.Fatalf("TUI transcript was not reset after /clear: %+v", m.transcript)
+	}
+	if len(m.shellTranscriptIdx) != 0 || len(m.shellOutputs) != 0 || len(m.shellExpanded) != 0 {
+		t.Fatalf("confirmed /clear should reset shell display state: idx=%v outputs=%v expanded=%v",
+			m.shellTranscriptIdx, m.shellOutputs, m.shellExpanded)
+	}
+}
+
+func TestClsClearsTranscriptDisplayState(t *testing.T) {
+	m := newTestChatTUI()
+	*m.pendingCommit = append(*m.pendingCommit, "stale pending")
+	m.transcript = []string{"banner", "shell card", "old shell output"}
+	m.wrappedLines = []string{"banner", "shell card", "old shell output"}
+	m.shellOutputs["shell-old"] = strings.Repeat("old shell output\n", shellPreviewLines+1)
+	m.shellExpanded["shell-old"] = false
+	m.shellTranscriptIdx["shell-old"] = 2
+	m.toolLineCountByID["shell-old"] = 3
+	m.toolStreamID = "shell-old"
+	m.toolStreamIdx = 2
+	m.toolTail = []string{"old shell output"}
+	m.toolPartial = "partial"
+	m.toolLineCount = 4
+
+	if cmd := m.runSlashCommand("/cls"); cmd != nil {
+		t.Fatal("/cls should clear locally without returning a command")
+	}
+	if len(*m.pendingCommit) != len(m.transcript) {
+		t.Fatalf("pendingCommit should only contain the fresh cleared-screen transcript, pending=%v transcript=%v",
+			*m.pendingCommit, m.transcript)
+	}
+	if len(m.shellTranscriptIdx) != 0 || len(m.shellOutputs) != 0 || len(m.shellExpanded) != 0 {
+		t.Fatalf("/cls should reset shell display state: idx=%v outputs=%v expanded=%v",
+			m.shellTranscriptIdx, m.shellOutputs, m.shellExpanded)
+	}
+	if len(m.toolLineCountByID) != 0 || m.toolStreamID != "" || m.toolStreamIdx != -1 || len(m.toolTail) != 0 || m.toolPartial != "" || m.toolLineCount != 0 {
+		t.Fatalf("/cls should reset live tool display state: counts=%v id=%q idx=%d tail=%v partial=%q lines=%d",
+			m.toolLineCountByID, m.toolStreamID, m.toolStreamIdx, m.toolTail, m.toolPartial, m.toolLineCount)
+	}
+
+	before := strings.Join(m.transcript, "\n")
+	m.toggleShellOutput()
+	if after := strings.Join(m.transcript, "\n"); after != before {
+		t.Fatalf("Ctrl+B after /cls should not rewrite the cleared transcript:\nbefore=%s\nafter=%s", before, after)
+	}
+	if strings.Contains(before, "old shell output") || strings.Contains(before, "/cls") {
+		t.Fatalf("/cls should keep only the fresh banner/notice, got:\n%s", before)
 	}
 }
 
@@ -1071,6 +1119,138 @@ func TestTranscriptScrollbarClickAndDrag(t *testing.T) {
 	}
 }
 
+// TestMouseDragReleaseAutoCopies verifies that releasing the mouse after a
+// left-drag over the transcript copies the selection to the clipboard
+// automatically (native terminal convention), keeps the selection highlighted
+// so a follow-up right-click can still re-copy it, and arms the transient
+// "copied to clipboard" status-line notice.
+func TestMouseDragReleaseAutoCopies(t *testing.T) {
+	m := newTestChatTUI()
+	m.transcript = []string{"hello world"}
+	m.wrappedLines = []string{"hello world"}
+	m.sel = selection{active: true, anchor: selPos{line: 0, col: 0}, head: selPos{line: 0, col: 5}}
+
+	out, cmd := m.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft})
+	m2, ok := out.(chatTUI)
+	if !ok {
+		t.Fatalf("Update returned %T, want chatTUI", out)
+	}
+
+	if cmd == nil {
+		t.Fatal("release after a real drag should return a cmd (clipboard copy + notice)")
+	}
+	if !m2.sel.active {
+		t.Error("selection should stay highlighted after auto-copy so right-click can re-copy it")
+	}
+	if m2.copyNoticeText == "" {
+		t.Error("release after a real drag should arm the copied-to-clipboard notice")
+	}
+}
+
+// TestMousePlainClickReleaseDoesNotCopy verifies that a plain click (no drag,
+// empty selection) does not copy an empty string to the clipboard or show the
+// copied notice — only clears the zero-width selection, as before.
+func TestMousePlainClickReleaseDoesNotCopy(t *testing.T) {
+	m := newTestChatTUI()
+	m.transcript = []string{"hello world"}
+	m.wrappedLines = []string{"hello world"}
+	at := selPos{line: 0, col: 3}
+	m.sel = selection{active: true, anchor: at, head: at} // empty: anchor == head
+
+	out, _ := m.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft})
+	m2, ok := out.(chatTUI)
+	if !ok {
+		t.Fatalf("Update returned %T, want chatTUI", out)
+	}
+
+	if m2.sel.active {
+		t.Error("a plain click (empty selection) should be cleared on release")
+	}
+	if m2.copyNoticeText != "" {
+		t.Error("a plain click (empty selection) must not arm the copied-to-clipboard notice")
+	}
+}
+
+// TestCopyNoticeExpires verifies the copied-to-clipboard notice clears itself
+// once its own expiry tick fires, and that a stale tick from an earlier copy
+// (superseded by a newer one) does not clear the newer notice.
+func TestCopyNoticeExpires(t *testing.T) {
+	m := newTestChatTUI()
+	m.copyNoticeText = i18n.M.MouseCopiedHint
+	m.copyNoticeSeq = 2
+
+	// A stale tick from a prior (superseded) copy must not clear the current notice.
+	out, _ := m.Update(copyNoticeExpireMsg{seq: 1})
+	m2 := out.(chatTUI)
+	if m2.copyNoticeText == "" {
+		t.Fatal("a stale expiry tick must not clear a newer notice")
+	}
+
+	// The current tick clears it.
+	out, _ = m2.Update(copyNoticeExpireMsg{seq: 2})
+	m3 := out.(chatTUI)
+	if m3.copyNoticeText != "" {
+		t.Fatal("the matching expiry tick should clear the notice")
+	}
+}
+
+// TestToggleMouseCaptureFlipsModeAndClearsGestures proves "/mouse" flips
+// mouseCaptureOff, shows the matching on/off notice, and drops any in-flight
+// selection/scrollbar drag so a stale gesture can't be found mid-drag once the
+// terminal starts intercepting the events that would have finished it.
+func TestToggleMouseCaptureFlipsModeAndClearsGestures(t *testing.T) {
+	m := newTestChatTUI()
+	m.transcript = []string{"hello world"}
+	m.wrappedLines = []string{"hello world"}
+	m.sel = selection{active: true, anchor: selPos{line: 0, col: 0}, head: selPos{line: 0, col: 5}}
+	m.scrollbarDrag = true
+	m.autoScroll = 1
+
+	m.toggleMouseCapture()
+	if !m.mouseCaptureOff {
+		t.Fatal("first toggle should turn mouse capture off")
+	}
+	if m.sel.active || m.scrollbarDrag || m.autoScroll != 0 {
+		t.Fatal("toggling mouse capture should clear any in-flight selection/drag")
+	}
+	if got := (*m.pendingCommit)[len(*m.pendingCommit)-1]; !strings.Contains(got, i18n.M.MouseCaptureOffHint) {
+		t.Fatalf("notice = %q, want it to contain %q", got, i18n.M.MouseCaptureOffHint)
+	}
+
+	m.toggleMouseCapture()
+	if m.mouseCaptureOff {
+		t.Fatal("second toggle should turn mouse capture back on")
+	}
+	if got := (*m.pendingCommit)[len(*m.pendingCommit)-1]; !strings.Contains(got, i18n.M.MouseCaptureOnHint) {
+		t.Fatalf("notice = %q, want it to contain %q", got, i18n.M.MouseCaptureOnHint)
+	}
+}
+
+// TestViewMouseModeFollowsCapture proves View() requests MouseModeNone (so
+// the terminal's native right-click menu and click-drag selection work) while
+// mouseCaptureOff is set, and MouseModeCellMotion (in-app selection/scrollbar/
+// wheel-scroll) otherwise.
+func TestViewMouseModeFollowsCapture(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 60)
+	m0, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
+	m = m0.(chatTUI)
+
+	if got := m.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("MouseMode with capture on = %v, want MouseModeCellMotion", got)
+	}
+
+	m.mouseCaptureOff = true
+	if got := m.View().MouseMode; got != tea.MouseModeNone {
+		t.Fatalf("MouseMode with capture off = %v, want MouseModeNone", got)
+	}
+	// Status line wraps at this width, so check the unwrapped tag rather than
+	// the rendered (possibly line-broken) View() content.
+	if got := m.mouseTag(); !strings.Contains(ansi.Strip(got), i18n.M.MouseCaptureTag) {
+		t.Fatalf("mouseTag() = %q, want it to contain %q", got, i18n.M.MouseCaptureTag)
+	}
+}
+
 func TestEchoLocalCommandAddsTranscriptMarker(t *testing.T) {
 	m := newTestChatTUI()
 	m.echoLocalCommand("  /tree  ")
@@ -1284,7 +1464,7 @@ func TestMemoryV5CommandWritesUserConfigNotProjectConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read user config: %v", err)
 	}
-	if !strings.Contains(string(userBody), `memory_compiler = { enabled = false }`) {
+	if !strings.Contains(string(userBody), `memory_compiler = { enabled = false, verbosity = "observe" }`) {
 		t.Fatalf("user config missing memory_compiler off:\n%s", userBody)
 	}
 	projectBody, err := os.ReadFile(projectPath)
@@ -1781,33 +1961,105 @@ func TestForceGotoBottomScrollsWithoutTranscriptChange(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	ch := make(chan event.Event, 1)
 	notice := agentEventMsg(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "line"})
-	adv := func(m chatTUI, msg tea.Msg) chatTUI {
-		n, _ := m.Update(msg)
-		return n.(chatTUI)
+	adv := func(m chatTUI, msg tea.Msg) (chatTUI, tea.Cmd) {
+		n, cmd := m.Update(msg)
+		return n.(chatTUI), cmd
+	}
+	next := func(m chatTUI, msg tea.Msg) chatTUI {
+		n, _ := adv(m, msg)
+		return n
 	}
 
-	cur := adv(newChatTUI(ctrl, "", ch, 80), tea.WindowSizeMsg{Width: 80, Height: 8})
+	cur := next(newChatTUI(ctrl, "", ch, 80), tea.WindowSizeMsg{Width: 80, Height: 8})
 	for i := 0; i < 12; i++ {
-		cur = adv(cur, notice)
+		cur = next(cur, notice)
 	}
 	if !cur.viewport.AtBottom() {
 		t.Fatal("new output while pinned should keep the viewport at the bottom")
 	}
 
-	cur = adv(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	cur = next(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 	if cur.viewport.AtBottom() {
 		t.Fatal("wheel-up should break the bottom pin")
 	}
 
 	cur.forceGotoBottom = true
 	cur.transcriptDirty = false
-	cur = adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
+	cur, cmd := adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
 
 	if !cur.viewport.AtBottom() {
 		t.Fatalf("forceGotoBottom should scroll without transcript changes, YOffset=%d", cur.viewport.YOffset())
 	}
 	if cur.forceGotoBottom {
 		t.Fatal("forceGotoBottom should be cleared after scrolling")
+	}
+	if cmd == nil {
+		t.Fatal("regular forceGotoBottom scroll jump should request ClearScreen")
+	}
+}
+
+func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	ch := make(chan event.Event, 1)
+	notice := agentEventMsg(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "line"})
+	adv := func(m chatTUI, msg tea.Msg) (chatTUI, tea.Cmd) {
+		n, cmd := m.Update(msg)
+		return n.(chatTUI), cmd
+	}
+	next := func(m chatTUI, msg tea.Msg) chatTUI {
+		n, _ := adv(m, msg)
+		return n
+	}
+
+	cur := next(newChatTUI(ctrl, "", ch, 80), tea.WindowSizeMsg{Width: 80, Height: 8})
+	for i := 0; i < 12; i++ {
+		cur = next(cur, notice)
+	}
+	cur = next(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if cur.viewport.AtBottom() {
+		t.Fatal("wheel-up should break the bottom pin")
+	}
+
+	cur.sessionSwitch = true
+	cur.forceGotoBottom = true
+	cur.transcriptDirty = false
+	cur, cmd := adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
+
+	if cmd != nil {
+		t.Fatal("session switch rebuild should suppress the ClearScreen scroll-jump workaround once")
+	}
+	if cur.sessionSwitch {
+		t.Fatal("sessionSwitch should be cleared after one Update")
+	}
+	if !cur.viewport.AtBottom() {
+		t.Fatalf("session switch should still land at bottom, YOffset=%d", cur.viewport.YOffset())
+	}
+
+	cur = next(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	cur.forceGotoBottom = true
+	cur, cmd = adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
+	if cmd == nil {
+		t.Fatal("later scroll jumps must still request ClearScreen")
+	}
+	if cur.sessionSwitch {
+		t.Fatal("sessionSwitch should remain false after the suppressed cycle")
+	}
+}
+
+func TestReplayActiveBranchClearsPlanModeAndMarksSessionSwitch(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.planMode = true
+	m.ctrl.SetPlanMode(true)
+	m.sessionSwitch = false
+
+	m.replayActiveBranch("switched branch")
+
+	if m.planMode || m.ctrl.PlanMode() {
+		t.Fatalf("replay should clear plan mode on both TUI and controller, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	}
+	if !m.sessionSwitch {
+		t.Fatal("replay should mark the next Update as a session switch")
 	}
 }
 

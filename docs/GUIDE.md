@@ -16,6 +16,8 @@
 - [Serve web frontend](#serve-web-frontend)
 - [Configuration paths](./CONFIG_PATHS.md)
 - [Reasoning language](./REASONING_LANGUAGE.md)
+- [Custom OpenAI-compatible providers](#custom-openai-compatible-providers)
+- [Desktop hooks](#desktop-hooks)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Permissions & sandbox](#permissions--sandbox)
 - [Plugins (MCP)](#plugins-mcp)
@@ -51,6 +53,7 @@ default_model = "deepseek-flash"   # executor; set [agent].planner_model to add 
 
 [ui]
 # shortcut_layout = "desktop"      # classic|desktop; compatibility setting
+# cursor_shape = "underline"       # block|underline|bar; CLI/TUI text cursor
 
 [agent]
 max_steps = 0                    # user/global only; executor tool-call rounds; 0 = no limit
@@ -61,8 +64,10 @@ reasoning_language = "auto"      # visible reasoning text: auto|zh|en
 # planner_model = "deepseek-pro"      # optional low-frequency planner
 # subagent_model = "deepseek-pro"     # optional default for runAs=subagent skills
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
+# max_subagent_depth = 2              # nested delegation depth; set 1 for the old single-layer boundary
 auto_plan = "off"                  # user-level only; off|on; off keeps plan mode manual
 # auto_plan_classifier = "deepseek-flash"   # optional; only borderline tasks call it
+tool_result_snip_ratio = 0.6       # shorten stale tool output before summary compaction
 
 [[providers]]
 name        = "deepseek-flash"
@@ -76,6 +81,11 @@ api_key_env = "DEEPSEEK_API_KEY"
 enabled = []   # omit/empty = all built-ins
 bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local cap
 mcp_call_timeout_seconds = 300   # default MCP call safety cap; per-plugin/tool overrides may raise it
+
+[environment]
+enabled = true   # inject a stable startup summary of OS, shell, and common tools
+# [environment.tools]
+# go = "/opt/homebrew/bin/go"   # optional explicit trusted path; workspace-local paths are not auto-executed
 
 [skills]
 # paths = ["~/my-skills", "../shared/skills"]   # extra custom skill roots
@@ -191,6 +201,70 @@ model and reasoning-effort controls, Goal, a live todo panel fed by the
 `--max-steps`, or `--resume` for one-off launches; otherwise `serve` uses the
 user-global `default_model`.
 
+## Custom OpenAI-compatible providers
+
+In the desktop app, open **Settings -> Model -> Access -> Add model service ->
+Custom provider** for proxies, aggregators, or self-hosted services that speak
+the OpenAI-compatible chat API.
+
+Fill **API address** with the provider endpoint that should receive the standard
+chat path. In this mode Reasonix previews and sends chat requests to:
+
+```text
+<API address>/chat/completions
+```
+
+Enable **Full URL** when the service gives you a complete request URL, for
+example `https://gateway.example.com/v1/chat/completions`. Reasonix then sends
+chat requests directly to that URL and does not append `/chat/completions`. The
+preview under the field shows the exact request URL that will be used.
+
+Model discovery uses the API address to try likely model-list URLs such as
+`/models` and `/v1/models`. If the gateway requires a separate model-list
+endpoint, open **Advanced settings** and set `models_url`, for example
+`https://gateway.example.com/v1/models`. If discovery is not available, fill the
+model list manually.
+
+**Full URL** still uses the OpenAI-compatible chat request body. It does not
+switch the request schema to the OpenAI Responses API.
+
+Some OpenAI-compatible gateways require non-standard top-level request body
+fields. Add them with `extra_body` on the provider entry:
+
+```toml
+[[providers]]
+name        = "spark"
+kind        = "openai"
+base_url    = "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"
+models      = ["xopglm52"]
+api_key_env = "SPARK_API_KEY"
+extra_body  = { enable_thinking = true }
+```
+
+`extra_body` is merged into the chat JSON request body. Reasonix keeps core
+fields such as `model`, `messages`, `tools`, and `stream` under its own control.
+
+## Desktop hooks
+
+Desktop hooks run local commands at lifecycle events such as `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, and `PreCompact`. A successful `SessionStart`
+hook may write plain text to stdout, or return JSON with
+`hookSpecificOutput.additionalContext`; Reasonix injects that text once into the
+next real user turn as `<hook-context event="SessionStart">...</hook-context>`.
+This is intended for plugin or workflow bootstrap context, including
+Superpowers-style startup instructions, without baking that workflow into
+Reasonix's system prompt.
+
+Plugin packages can provide this startup context through
+`hooks/session-start-codex` or a plugin-root `CLAUDE.md`. Claude-style
+`.claude/settings.json` command hooks are also mapped to matching Reasonix hook
+events.
+
+The injected hook context is dynamic current-turn context. It does not change
+the stable system prompt, memory prefix, or tool schema, though dynamic content
+can still reduce cache reuse for that turn. The detailed desktop hook schema and
+trust model are documented in [the Chinese desktop hooks guide](./DESKTOP_HOOKS.zh-CN.md).
+
 ## Keyboard shortcuts
 
 Shortcuts are documented by client because users usually look for the keys that
@@ -200,6 +274,12 @@ paste key.
 
 `[ui].shortcut_layout` is still accepted for old configs, but the shortcut
 behavior below is unified across layouts.
+
+For CLI/TUI text input, `[ui].cursor_shape` accepts `underline`, `block`, or
+`bar`. The default is `underline` because terminal block cursors can visually
+cover double-width CJK characters in some mixed-language input. Set it to
+`block` to keep the old terminal-style cursor, or `bar` for a thin insertion
+cursor. This setting does not change desktop or web text fields.
 
 ### Desktop GUI
 
@@ -258,10 +338,12 @@ Chat and transcript shortcuts:
 | Plain `Up` / `Down` while idle | Recalls older or newer submitted prompts | In a running turn, the same keys navigate queued follow-up feedback. |
 | `PageUp` / `PageDown` | Scrolls the transcript | Works regardless of the current chat state. |
 | `Ctrl+Home` / `Ctrl+End` | Jumps to the top or bottom of the transcript | Useful after long tool output. |
+| `Ctrl+L` or `/cls` | Clears only the visible transcript | The LLM context, session file, tools, memory, and plugins stay loaded. Use `/clear` when you want to discard the conversation context. |
 | `Esc` | Backs out of the current action | It un-sends a just-submitted turn before any reply, cancels a running turn, or clears non-empty input. |
 | Double `Esc` on an empty idle composer | Opens the rewind picker | Same entry point as `/rewind`. |
-| Terminal native selection | Copies transcript text | Reasonix does not enable mouse reporting by default, so terminal selection/copy remains available. |
-| `Ctrl+C` | Cancels, clears, or quits | Cancels a running turn, clears non-empty input, or quits on a second empty-composer press. |
+| Transcript text selection | Copies transcript text | The full-screen TUI enables mouse reporting, so drag in the transcript to select text in-app; releasing the mouse copies it automatically, and `Ctrl+C`/`Super+C`/`Meta+C` or right-clicking the active selection copy it again. |
+| `/mouse` | Toggles in-app mouse capture | Off hands the mouse back to your terminal, restoring its native click-drag selection and right-click context menu, at the cost of in-app drag-select, the transcript scrollbar, and wheel-scroll. Set `REASONIX_DISABLE_MOUSE=1` to start every session with it off. |
+| `Ctrl+C` | Copies, cancels, clears, or quits | Copies an active transcript selection first. Otherwise it cancels a running turn, clears non-empty input, or quits on a second empty-composer press. |
 | `Ctrl+D` | Quits the TUI | Immediate quit. |
 | `Ctrl+V`, `Ctrl+Shift+V`, `Meta+V`, or `Super+V` | Pastes clipboard content | The CLI tries an image first, then falls back to text or file references. |
 | `/paste-image` | Pastes a clipboard image | Use it when you want image-only paste or the terminal handles text paste itself. |
@@ -275,7 +357,7 @@ Mode and display shortcuts:
 | `Ctrl+Y` | Toggles YOLO on/off | Turning YOLO off restores the previous Ask/Auto base when known. Terminals that forward Command/Super may also send `Cmd+Y`, but `Ctrl+Y` is the reliable terminal shortcut. |
 | `--yolo`, `--dangerously-skip-permissions` | Starts chat in YOLO | Same runtime mode as `Ctrl+Y`. |
 | `Ctrl+O` | Toggles verbose reasoning display | Also available through `/verbose`. |
-| `Ctrl+B` | Expands or collapses long shell output | Works with terminal-native text selection because the TUI does not enable mouse reporting by default. |
+| `Ctrl+B` | Expands or collapses long shell output | Long shell-output hint lines can also be clicked in the transcript; text selection is handled in-app while the full-screen TUI has mouse reporting enabled. |
 | Ask / Auto | No keyboard cycle | Ask is the default interactive base. Auto is not entered through `Shift+Tab`; use clients or APIs that expose the tool approval posture directly. |
 | `/goal <objective>`, `/goal --research <objective>`, `/goal --simple <objective>`, `/goal status`, `/goal clear` | Starts, checks, or clears Goal | Goal is not in any keyboard cycle; clearly long-horizon goals automatically enable AutoResearch. Ordinary prompts with strong AutoResearch signals are also upgraded into Goal. |
 | `/migrate`, `/migrate --from <legacy-dir>` | Retries legacy migration or imports sessions from a chosen v0.x source | Use `--from` for custom Windows v0.52 install/data directories; it imports sessions only. See [Configuration paths](./CONFIG_PATHS.md). |
@@ -439,12 +521,17 @@ desktop app because they all share the same local controller. It records local,
 project-scoped execution traces and compiler state under Reasonix home, then
 compiles the next user turn into a compact execution contract only when prior
 outcomes produce actionable constraints. Early turns may only write traces and
-inject nothing. Memory v5 never bypasses memory approvals, never uploads memory
-content, and never mutates the cache-stable system prompt, provider prefix, or
-tool schemas.
+inject nothing. The default `verbosity = "observe"` keeps this as local learning
+and content-free metrics only; it does not send `<memory-compiler-execution>` to
+the provider-visible user turn. Opt into `verbosity = "compact"` (or the legacy
+`on` command) when you explicitly want compact execution-contract injection,
+including selected compact memory references in the provider-visible user turn.
+Memory v5 never bypasses memory approvals and never mutates the cache-stable
+system prompt, provider prefix, or tool schemas.
 
-Toggle future turns with `/memory-v5 off|on|status` inside an interactive
-session, or with `reasonix config memory-v5 off|on|status` from a shell/script.
+Toggle future turns with `/memory-v5 off|observe|compact|on|status` inside an
+interactive session, or with `reasonix config memory-v5 off|observe|compact|on|status`
+from a shell/script.
 Desktop users can also use Settings → General → Memory v5. Settings → Updates →
 Share aggregate quality metrics controls the optional aggregate upload. When
 enabled, that upload may include only anonymous
@@ -460,7 +547,7 @@ Reasonix home:
 
 ```toml
 [agent]
-memory_compiler = { enabled = false }
+memory_compiler = { enabled = true, verbosity = "observe" }
 ```
 
 The CLI can use Memory v5 for local turns, but it does not run the desktop
@@ -564,11 +651,22 @@ Subagent skills inherit the executor model by default. Set `subagent_model` to
 run them on another configured model, or use `subagent_models` to override only
 specific skills such as `review` or `security_review`.
 
+Subagents may delegate one more layer by default: the root session is depth 0,
+first-layer subagents are depth 1, and the maximum `max_subagent_depth = 2`
+means a depth-1 workflow can dispatch a depth-2 reviewer or implementer. Depth-2
+subagents do not receive recursive agent/skill tools. Set
+`agent.max_subagent_depth = 1` to restore the old single-layer boundary. This is
+intended for workflows such as Superpowers where a workflow skill may dispatch a
+reviewer subagent, while still avoiding unbounded recursion and background
+fanout.
+
 Use `read_only_task` when planning needs isolated, deeper research without
 granting write-capable delegation. Use `read_only_skill` when the same need is
 best expressed through an existing skill. Both run ephemeral read-only
 subagents with only read-only research tools plus safe foreground bash, return
-only the final answer, and do not create resumable subagent transcripts. In
+only the final answer, and do not create resumable subagent transcripts.
+Read-only nested delegation may be available until `max_subagent_depth` is
+reached, but writer-capable `task` / `run_skill` remain unavailable. In
 token economy mode, connect only this narrow surface with
 `connect_tool_source(source="read_only_skill")`; the full `skills` source still
 enables writer-capable skill tools and remains blocked in plan mode.
@@ -584,8 +682,8 @@ inputs and falls back to the heuristic if classification fails. Use
 only; `agent.auto_plan` in a project `reasonix.toml` is ignored. The visible
 reasoning language uses a similar shape: `/reasoning-language auto|zh|en` in the
 session, or `reasonix config reasoning-language auto|zh|en` in a shell/script.
-Memory v5 uses `/memory-v5 off|on|status` or
-`reasonix config memory-v5 off|on|status` and is user-level only. Pass `--local`
+Memory v5 uses `/memory-v5 off|observe|compact|on|status` or
+`reasonix config memory-v5 off|observe|compact|on|status` and is user-level only. Pass `--local`
 to the reasoning-language shell command only when you intentionally want a
 project-local override.
 

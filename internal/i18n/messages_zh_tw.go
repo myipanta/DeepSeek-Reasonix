@@ -99,7 +99,7 @@ var ChineseTraditional = Messages{
 	SlashUnavailable:   "當前建構不支援該命令",
 	SlashUnknown:       "未知命令",
 	SlashTodoCleared:   "已清除任務清單",
-	SlashHelp:          "命令：/compact · /new（/clear）· /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切換模型）· /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /remember · /quit · /help · 以及 skills（/init、/explore …）",
+	SlashHelp:          "命令：/compact · /new（/clear）· /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切換模型）· /effort · /theme · /language · /mcp · /skills · /plugins · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /remember · /quit · /help · 以及 skills（/init、/explore …）",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d 個可用",
@@ -150,6 +150,10 @@ var ChineseTraditional = Messages{
 	CtrlCQuitHint:                "再按一次 Ctrl+C 退出",
 	CompHintSlash:                "↑/↓ 移動 · Tab/Enter 選中 · Esc 關閉",
 	CompHintFile:                 "↑/↓ 移動 · Tab/Enter 進入資料夾或選中檔案 · Esc 關閉",
+	MouseCopiedHint:              "已複製到剪貼簿",
+	MouseCaptureOnHint:           "滑鼠接管已開啟 — 應用內拖拽選取/捲軸/滾輪生效",
+	MouseCaptureOffHint:          "滑鼠接管已關閉 — 由終端原生處理選取與右鍵選單",
+	MouseCaptureTag:              "終端原生滑鼠",
 
 	ShellExecEmpty:      "用法：!<命令>  （例如 !ls -la）",
 	ShellExecFailedFmt:  "Shell 命令執行失敗：%v",
@@ -157,6 +161,7 @@ var ChineseTraditional = Messages{
 	ShellModeHint:       "Enter 執行 Shell · Esc 取消 · 點擊輸出展開",
 
 	CmdNew:              "清空上下文並儲存歷史",
+	CmdCls:              "清除畫面（保留 LLM 上下文）",
 	CmdCompact:          "壓縮上下文",
 	CmdRewind:           "回滾到更早的一輪",
 	CmdTree:             "檢視對話分支樹",
@@ -170,6 +175,7 @@ var ChineseTraditional = Messages{
 	CmdForget:           "刪除一條已存記憶",
 	CmdMcp:              "MCP 伺服器",
 	CmdHooks:            "管理 hooks",
+	CmdPlugins:          "管理插件包",
 	CmdPasteImage:       "貼上剪貼簿圖片",
 	CmdOutputStyle:      "列出輸出風格",
 	CmdTheme:            "切換 CLI 主題",
@@ -179,6 +185,7 @@ var ChineseTraditional = Messages{
 	CmdReloadCmd:        "重載自定義命令",
 	CmdSandbox:          "檢視沙箱狀態",
 	CmdEffort:           "設定推理強度",
+	CmdMouse:            "切換滑鼠接管（關閉後由終端原生處理選取/右鍵）",
 	CmdAutoPlan:         "設定自動計畫模式",
 	CmdReasonLang:       "設定可見思考語言",
 	CmdMemoryV5:         "切換 Memory v5",
@@ -335,7 +342,7 @@ var ChineseTraditional = Messages{
   reasonix acp [--model NAME]                           透過 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 互動式設定精靈；生成 reasonix.toml（及 .env）
   reasonix config auto-plan [off|on]                    設定自動計畫模式
-  reasonix config memory-v5 [off|on|status]             設定 Memory v5
+  reasonix config memory-v5 [off|observe|compact|on|status]  設定 Memory v5
   reasonix config reasoning-language [auto|zh|en]        設定可見思考語言
   reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 裡的 MCP 伺服器
   reasonix init                                         查看如何產生專案記憶（AGENTS.md）
@@ -365,6 +372,7 @@ var ChineseTraditional = Messages{
 	SlashClearPrompt:           "清空當前上下文且不儲存？",
 	SlashClearDone:             "已清空當前上下文",
 	SlashClearFailed:           "清空當前上下文失敗",
+	SlashClsDone:               "已清除畫面（LLM 上下文保留）",
 	CmdClear:                   "丟棄當前上下文",
 	CmdRename:                  "重新命名會話",
 	CmdGoal:                    "設定或清除當前目標",

@@ -104,10 +104,11 @@ var English = Messages{
 	SlashClearPrompt:   "Clear current context without saving?",
 	SlashClearDone:     "current context cleared",
 	SlashClearFailed:   "could not clear current context",
+	SlashClsDone:       "screen cleared",
 	SlashUnavailable:   "command unavailable in this build",
 	SlashUnknown:       "unknown command",
 	SlashTodoCleared:   "task list dismissed",
-	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
+	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /plugins · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d available",
@@ -158,6 +159,10 @@ var English = Messages{
 	CtrlCQuitHint:                "press Ctrl+C again to quit",
 	CompHintSlash:                "↑/↓ move · Tab/Enter select · Esc close",
 	CompHintFile:                 "↑/↓ move · Tab/Enter open folder or pick file · Esc close",
+	MouseCopiedHint:              "copied to clipboard",
+	MouseCaptureOnHint:           "mouse capture on — in-app drag-select/scrollbar/wheel active",
+	MouseCaptureOffHint:          "mouse capture off — your terminal now handles selection and right-click",
+	MouseCaptureTag:              "native mouse",
 
 	ShellExecEmpty:      "usage: !<command>  (e.g. !ls -la)",
 	ShellExecFailedFmt:  "shell command failed: %v",
@@ -166,6 +171,7 @@ var English = Messages{
 
 	CmdNew:              "start new session; save transcript",
 	CmdClear:            "discard current context",
+	CmdCls:              "clear screen only (keep LLM context)",
 	CmdCompact:          "compact context",
 	CmdRewind:           "rewind to an earlier turn",
 	CmdTree:             "show conversation branches",
@@ -181,6 +187,7 @@ var English = Messages{
 	CmdForget:           "archive a saved memory",
 	CmdMcp:              "MCP servers",
 	CmdHooks:            "manage hooks",
+	CmdPlugins:          "manage plugin packages",
 	CmdPasteImage:       "paste clipboard image",
 	CmdOutputStyle:      "list output styles",
 	CmdTheme:            "switch CLI theme",
@@ -191,6 +198,7 @@ var English = Messages{
 	CmdDiffFold:         "toggle diff fold/expand",
 	CmdSandbox:          "show sandbox status",
 	CmdEffort:           "set reasoning effort",
+	CmdMouse:            "toggle in-app mouse capture (off = native terminal selection/right-click)",
 	CmdAutoPlan:         "configure automatic plan mode",
 	CmdReasonLang:       "set visible reasoning language",
 	CmdMemoryV5:         "toggle Memory v5",
@@ -385,7 +393,7 @@ Usage:
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
   reasonix config auto-plan [off|on]                    configure automatic plan mode
-  reasonix config memory-v5 [off|on|status]             configure Memory v5
+  reasonix config memory-v5 [off|observe|compact|on|status]  configure Memory v5
   reasonix config reasoning-language [auto|zh|en]        configure visible reasoning language
   reasonix mcp <add|remove|list|import>                 manage MCP servers in reasonix.toml
   reasonix init                                         show how to generate project memory (AGENTS.md)

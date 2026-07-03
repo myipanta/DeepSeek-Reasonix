@@ -105,10 +105,11 @@ var Chinese = Messages{
 	SlashClearPrompt:   "清空当前上下文且不保存？",
 	SlashClearDone:     "已清空当前上下文",
 	SlashClearFailed:   "清空当前上下文失败",
+	SlashClsDone:       "已清屏（LLM 上下文保留）",
 	SlashUnavailable:   "当前构建不支持该命令",
 	SlashUnknown:       "未知命令",
 	SlashTodoCleared:   "已清除任务清单",
-	SlashHelp:          "命令：/compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切换模型）· /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · 以及 skills（/init、/explore …）",
+	SlashHelp:          "命令：/compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切换模型）· /effort · /theme · /language · /mcp · /skills · /plugins · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · 以及 skills（/init、/explore …）",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d 个可用",
@@ -159,6 +160,10 @@ var Chinese = Messages{
 	CtrlCQuitHint:                "再按一次 Ctrl+C 退出",
 	CompHintSlash:                "↑/↓ 移动 · Tab/Enter 选中 · Esc 关闭",
 	CompHintFile:                 "↑/↓ 移动 · Tab/Enter 进入文件夹或选中文件 · Esc 关闭",
+	MouseCopiedHint:              "已复制到剪贴板",
+	MouseCaptureOnHint:           "鼠标接管已开启 — 应用内拖拽选中/滚动条/滚轮生效",
+	MouseCaptureOffHint:          "鼠标接管已关闭 — 由终端原生处理选中和右键菜单",
+	MouseCaptureTag:              "终端原生鼠标",
 
 	ShellExecEmpty:      "用法：!<命令>  （例如 !ls -la）",
 	ShellExecFailedFmt:  "Shell 命令执行失败：%v",
@@ -167,6 +172,7 @@ var Chinese = Messages{
 
 	CmdNew:              "开启新会话并保存历史",
 	CmdClear:            "丢弃当前上下文",
+	CmdCls:              "清屏（保留 LLM 上下文）",
 	CmdCompact:          "压缩上下文",
 	CmdRewind:           "回滚到更早的一轮",
 	CmdTree:             "查看对话分支树",
@@ -182,6 +188,7 @@ var Chinese = Messages{
 	CmdForget:           "归档一条已存记忆",
 	CmdMcp:              "MCP 服务器",
 	CmdHooks:            "管理 hooks",
+	CmdPlugins:          "管理插件包",
 	CmdPasteImage:       "粘贴剪贴板图片",
 	CmdOutputStyle:      "列出输出风格",
 	CmdTheme:            "切换 CLI 主题",
@@ -192,6 +199,7 @@ var Chinese = Messages{
 	CmdDiffFold:         "切换 diff 折叠/展开",
 	CmdSandbox:          "查看沙箱状态",
 	CmdEffort:           "设置推理强度",
+	CmdMouse:            "切换鼠标接管（关闭后由终端原生处理选中/右键）",
 	CmdAutoPlan:         "配置自动计划模式",
 	CmdReasonLang:       "设置可见思考语言",
 	CmdMemoryV5:         "切换 Memory v5",
@@ -386,7 +394,7 @@ var Chinese = Messages{
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 交互式配置向导；生成 reasonix.toml（及 .env）
   reasonix config auto-plan [off|on]                    配置自动计划模式
-  reasonix config memory-v5 [off|on|status]             配置 Memory v5
+  reasonix config memory-v5 [off|observe|compact|on|status]  配置 Memory v5
   reasonix config reasoning-language [auto|zh|en]        配置可见思考语言
   reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 里的 MCP 服务器
   reasonix init                                         查看如何生成项目记忆（AGENTS.md）
