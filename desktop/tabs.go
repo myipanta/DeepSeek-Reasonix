@@ -6252,16 +6252,35 @@ func isAutomaticRecoverySessionPath(path string) bool {
 		return false
 	}
 	suffix := id[idx+len("-recovery-"):]
-	if len(suffix) != 16 {
-		return false
-	}
-	for _, r := range suffix {
-		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
-			continue
+	// Standard recovery: -recovery-{16hex}
+	// Shutdown recovery: -recovery-{16hex}-{12hex}
+	if len(suffix) == 16 {
+		for _, r := range suffix {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+				continue
+			}
+			return false
 		}
-		return false
+		return true
 	}
-	return true
+	if len(suffix) == 29 && suffix[16] == '-' {
+		hexPart := suffix[:16]
+		writerPart := suffix[17:]
+		for _, r := range hexPart {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+				continue
+			}
+			return false
+		}
+		for _, r := range writerPart {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func legacyMigrationTargetForDir(dir string) (scope, workspaceRoot, topicTitleRoot string, ok bool) {
